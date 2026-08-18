@@ -47,6 +47,7 @@ Cross-skill paths (e.g. `using-powerflow/references/complexity-rubric.md`) resol
 3. **Delegation rule**:
    - **Big tasks**: delegate codebase discovery, plan drafting, implementation, and reviews to subagents (registry below). The orchestrator handles only decisions, user communication, reading `<task-dir>` files, and git operations.
    - **Small tasks**: the orchestrator may search, read, edit, and test directly. No subagent reviews. After implementation, run the one-line scope check: list the files changed and confirm every one is in the plan's scope.
+   - **Mid-Flight Escalation**: if a Small task expands in scope (>2 files, schema changes, new modules) during execution, immediately stop, reclassify as Big in `summary.md`, and transition to Planning.
 
 4. **Evidence rule**: two labels only — `FACT` (with `file:line`) and `ASSUMPTION` (always marked). Every claim in `brief.md` carries one label; bare claims are rewritten. Full rule: [global-epistemology.md](references/global-epistemology.md).
 
@@ -54,7 +55,7 @@ Cross-skill paths (e.g. `using-powerflow/references/complexity-rubric.md`) resol
    - Create it with `powerflow-brainstorming/scripts/init-task-dir.sh`. Exit 2 (exists with content) or 3 (orphan): ask the user — resume, reuse, or new slug. Never overwrite an existing task dir.
    - `summary.md` is the state. If it exists, resume from the phase it records — do not reinitialize. There is no `state.json`.
 
-6. **Escalation**: if any review round fails twice in a row with the same blockers, STOP and ask the user, writing the request to `<task-dir>/reports/blocker.md` (template in `powerflow-planning/SKILL.md`). No counters, no caps.
+6. **Escalation**: if any review round fails twice in a row with the same blockers OR reaches 3 review rounds without approval, STOP and ask the user, writing the request to `<task-dir>/reports/blocker.md` (template in `powerflow-planning/SKILL.md`).
 
 7. **Platform mapping**: skill text uses abstract operations ("spawn a subagent"). Map to concrete tools via [platform-tools.md](references/platform-tools.md).
 

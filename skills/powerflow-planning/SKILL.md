@@ -31,7 +31,7 @@ Spawn a subagent using the **Plan Drafter** prompt from [subagent-prompts.md](..
 
 - The contract above
 - Assumptions section (each with a way to verify it)
-- Steps: task ID (TASK-001…), description, evidence link (`file:line`), the failing test to write first, the minimal implementation, the verification command, the atomic commit message
+- Steps: task ID (TASK-001…), description, evidence link (`file:line`), the verification method (failing test for logic/code, or explicit verification command/schema check/lint for config/UI/scripts), the minimal implementation, the verification command, the atomic commit message
 
 ## 3. Checkpoint B (Big)
 
@@ -44,7 +44,7 @@ Spawn a subagent using the **Plan Reviewer** prompt from [subagent-prompts.md](.
 - **APPROVED** → proceed to Final Plan Lock.
 - **REVISE AND RESUBMIT** → revise the plan (v2, v3…), re-run the Plan Reviewer.
 - **BLOCKED** → revise and re-run.
-- If the second review round returns with the same blockers → STOP and ask the user, writing the request to `<task-dir>/reports/blocker.md` (template below). No counters, no caps.
+- **Escalation**: if the second review round returns with the same blockers, OR if 3 review rounds (v3) are reached without approval → STOP and ask the user, writing the request to `<task-dir>/reports/blocker.md` (template below).
 
 ## 5. Final Plan Lock
 

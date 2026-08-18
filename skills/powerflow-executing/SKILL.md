@@ -23,8 +23,10 @@ description: Load when an approved plan exists. Implements Small tasks directly 
 
 ## 2. Implement
 
-- **Small**: implement directly. Write tests for non-trivial logic, run them, and commit. After the last edit, run the **one-line scope check**: list the files changed and confirm each is in the contract's Scope. No subagent reviews.
-- **Big**: spawn a subagent using the **Implementer** prompt from [subagent-prompts.md](../using-powerflow/references/subagent-prompts.md). It executes steps task-by-task (failing test → minimal implementation → test passes → atomic commit `TASK-XXX: ...`), appends to `<task-dir>/executions/execution-log.md`, and stops on failure.
+- **Small**: implement directly. Write tests for non-trivial logic (or run concrete verification commands for non-testable code/config/scripts), verify, and commit.
+  - **Mid-Flight Escalation**: if during execution the scope unexpectedly expands (>2 files, new abstractions, schema migrations, cross-cutting dependencies), STOP direct editing immediately, update classification to `Big` in `summary.md`, and transition to [powerflow-planning](../powerflow-planning/SKILL.md).
+  - After the last edit, run the **one-line scope check**: list the files changed and confirm each is in the contract's Scope. No subagent reviews.
+- **Big**: spawn a subagent using the **Implementer** prompt from [subagent-prompts.md](../using-powerflow/references/subagent-prompts.md). It executes steps task-by-task (failing test / concrete verification step → minimal implementation → test passes → atomic commit `TASK-XXX: ...`), appends to `<task-dir>/executions/execution-log.md`, and stops on failure.
 
 ## 3. Failures (Big)
 
@@ -37,7 +39,7 @@ Spawn a subagent using the **Implementation Reviewer** prompt. It writes `<task-
 - **ACCEPTED** → proceed to Verification.
 - **SEND BACK** → spawn the Implementer to fix the listed defects (commit prefixed `FIX: ...`), then re-run this review.
 - **ESCALATE** (e.g. scope damage) → STOP and ask the user immediately with `reports/blocker.md`.
-- If two consecutive reviews return the same blockers → STOP and ask the user. No counters, no caps.
+- **Review Cap**: if two consecutive reviews return the same blockers OR 3 review rounds are reached without `ACCEPTED` → STOP and ask the user.
 
 ## 5. Verification
 
@@ -49,6 +51,6 @@ Spawn a subagent using the **Implementation Reviewer** prompt. It writes `<task-
 ## Non-Negotiable Behaviors
 
 - **Scope lock is absolute**: never edit, create, or delete a file outside the contract's Scope. Expanding scope requires the user's OK.
-- **TDD cycle per step**: failing test → minimal implementation → test passes → atomic commit with the task ID. Never group steps into one commit.
+- **Verification cycle per step**: failing test (or concrete command check for non-testable tasks) → minimal implementation → verification passes → atomic commit with the task ID. Never group steps into one commit.
 - **Never self-approve** (Big): implementation and coverage checks are delegated to an independent subagent.
 - **Failure stops the pipeline**: stop and report; never silently patch or skip a failure.

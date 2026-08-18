@@ -36,4 +36,20 @@ if [ -d "$TASK_DIR" ]; then
 fi
 
 mkdir -p "$TASK_DIR"/{context,plans,reviews,executions/diagnostics,reports}
+
+# Ensure .powerflow/ is gitignored
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  GIT_ROOT=$(git rev-parse --show-toplevel)
+  GITIGNORE="$GIT_ROOT/.gitignore"
+  if [ -f "$GITIGNORE" ]; then
+    if ! grep -qxE '^\.?powerflow/?$' "$GITIGNORE" && ! grep -q '^\.powerflow/' "$GITIGNORE"; then
+      printf "\n# Powerflow task directory\n.powerflow/\n" >> "$GITIGNORE"
+      echo "Added .powerflow/ to $GITIGNORE" >&2
+    fi
+  else
+    printf "# Powerflow task directory\n.powerflow/\n" > "$GITIGNORE"
+    echo "Created $GITIGNORE with .powerflow/" >&2
+  fi
+fi
+
 echo "$TASK_DIR"

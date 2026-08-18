@@ -8,7 +8,7 @@ set -euo pipefail
 
 MESSAGE=""
 UNCOMMITTED=false
-BASE_BRANCH="main"
+BASE_BRANCH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -24,12 +24,39 @@ if [ "$UNCOMMITTED" = false ] && [ -z "$MESSAGE" ]; then
   exit 1
 fi
 
-BASE_COMMIT=$(git merge-base HEAD "$BASE_BRANCH" 2>/dev/null) || {
-  echo "Error: no merge base with $BASE_BRANCH (pass --base-branch)" >&2
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || {
+  echo "Error: Not in a git repository" >&2
   exit 1
 }
 
-echo "Found $(git rev-list --count "$BASE_COMMIT"..HEAD) commit(s) since $BASE_BRANCH"
+# Auto-detect base branch if not explicitly provided
+if [ -z "$BASE_BRANCH" ]; then
+  for candidate in main master develop dev trunk; do
+    if [ "$CURRENT_BRANCH" != "$candidate" ] && git show-ref --verify --quiet "refs/heads/$candidate"; then
+      BASE_BRANCH="$candidate"
+      echo "Auto-detected base branch: $BASE_BRANCH" >&2
+      break
+    fi
+  done
+fi
+
+if [ -z "$BASE_BRANCH" ]; then
+  echo "Error: Could not auto-detect base branch. Please specify --base-branch <branch>." >&2
+  exit 1
+fi
+
+BASE_COMMIT=$(git merge-base HEAD "$BASE_BRANCH" 2>/dev/null) || {
+  echo "Error: no merge base with $BASE_BRANCH (pass --base-branch <branch>)" >&2
+  exit 1
+}
+
+COMMIT_COUNT=$(git rev-list --count "$BASE_COMMIT"..HEAD)
+if [ "$COMMIT_COUNT" -eq 0 ]; then
+  echo "No commits found between $BASE_BRANCH ($BASE_COMMIT) and HEAD. Nothing to squash."
+  exit 0
+fi
+
+echo "Found $COMMIT_COUNT commit(s) since $BASE_BRANCH"
 
 git reset --soft "$BASE_COMMIT"
 

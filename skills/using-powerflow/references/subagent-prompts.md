@@ -35,9 +35,9 @@ Read `<task-dir>/context/brief.md` (or, for bug fixes, the most recent Diagnosis
   - Acceptance Criteria: testable pass/fail list
   - Out of Scope: explicit exclusions
 - **Assumptions section**: assumptions from the brief, each with a way to verify it.
-- **Steps**: each with task ID (TASK-001…), description, evidence link (`file:line`), the failing test to write first, the minimal implementation, the verification command, and the atomic commit message.
+- **Steps**: each with task ID (TASK-001…), description, evidence link (`file:line`), the verification method (failing test to write first, or explicit validation command / dry-run / schema check for config/UI/scripts), the minimal implementation, the verification command, and the atomic commit message.
 
-Steps must be bite-sized: one test + one minimal change per step. Inspect code as needed — keep all reading noise in your session. Report completion when the file is written.
+Steps must be bite-sized: one test/check + one minimal change per step. Inspect code as needed — keep all reading noise in your session. Report completion when the file is written.
 
 ## Plan Reviewer (Planning, Big)
 
@@ -48,7 +48,7 @@ Read `<task-dir>/plans/plan-v1.md` (or vN). Your job is to find defects, not to 
 - Every file/API referenced actually exists (spot-check with search/read).
 - At least 2 realistic failure scenarios, including one multi-step cascade.
 - Edge cases per step (empty input, boundaries, missing dependencies) have mitigations.
-- Acceptance criteria are testable and the step tests cover them.
+- Acceptance criteria are testable/verifiable and the step checks cover them.
 - Scope and Out of Scope are unambiguous.
 
 Write `<task-dir>/reviews/plan-review.md` with verdict:
@@ -64,7 +64,7 @@ List Critical/High/Medium/Low findings. Report completion.
 
 Read `<task-dir>/plans/plan-final.md`. The Implementation Contract is the highest authority: never edit, create, or delete a file outside its Scope; never touch Must Not Change.
 
-Execute steps in order. For EACH step run the full TDD cycle: write the failing test → write the minimal implementation → verify the test passes → commit with message prefixed `TASK-XXX: ` (the step's task ID). Never group steps into one commit. Append one line per step to `<task-dir>/executions/execution-log.md`.
+Execute steps in order. For EACH step run the verification cycle: write the failing test (or set up the concrete verification check for non-unit-testable files like configs/scripts) → write the minimal implementation → verify the test/check passes → commit with message prefixed `TASK-XXX: ` (the step's task ID). Never group steps into one commit. Append one line per step to `<task-dir>/executions/execution-log.md`.
 
 If any step fails: STOP and report the failure — do not patch beyond the failed step, do not continue to the next step. If re-spawned after a diagnosis, fix only the failed step per the Diagnosis Report.
 
@@ -77,7 +77,7 @@ Do not exit until all steps are implemented and committed, or you have stopped o
 Read `<task-dir>/plans/plan-final.md` and the implemented code. Verify:
 - Conformance: every plan step implemented as specified.
 - Scope: no file changed outside Scope; nothing in Must Not Change was touched.
-- Acceptance criteria: each has a passing test (run them); flag any AC without coverage.
+- Acceptance criteria: each has a passing test or verifiable output; flag any AC without coverage/proof.
 - Regressions: no obvious breakage in touched areas.
 
 Write `<task-dir>/reviews/implementation-review.md` with verdict:

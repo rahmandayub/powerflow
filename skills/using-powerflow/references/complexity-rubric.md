@@ -28,6 +28,20 @@ Two classifications only. **Small** tasks skip subagent delegation and reviews; 
 | Executing | Direct implementation + one-line scope check | Implementer subagent + Implementation Reviewer |
 | Finishing | Same as Big | Same as Small |
 
+## Mid-Execution Escalation (Small ➔ Big)
+
+If a task was initially classified as **Small**, but during execution:
+- Scope expands beyond 2 files,
+- Unforeseen cross-module dependencies or schema migrations arise,
+- A new architectural abstraction becomes necessary, or
+- Regression risk proves higher than anticipated:
+
+**Trigger Mid-Flight Escalation**:
+1. STOP direct execution immediately.
+2. Update classification in `<task-dir>/summary.md` to `Big` (with one-line reason).
+3. Switch to `powerflow-planning` (or Checkpoint A in `powerflow-brainstorming` if the high-level approach must change).
+4. Draft a formal plan (`plan-v1.md`) and run the subagent review loop before resuming implementation.
+
 ## Override
 
 If the user disagrees with the classification, mark `[OVERRIDE BY USER]` in the brief and use the user's choice.
