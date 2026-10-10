@@ -178,14 +178,17 @@ Which option?
          do not assume `origin`), then merge.
        - **Task worktree** (integration branch checked out in ANOTHER
          worktree, so this worktree cannot take it): do NOT checkout — run
-         the merge in the worktree that owns the integration branch:
+         the merge in the worktree that owns the integration branch.
+         First pull there explicitly (before merging):
          ```bash
          MAIN_ROOT=$(git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel)
+         git -C "$MAIN_ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}'  # upstream present?
+         git -C "$MAIN_ROOT" pull --ff-only    # or record "offline, skipped pull" when no upstream/offline
          git -C "$MAIN_ROOT" merge --ff-only <task-branch> || git -C "$MAIN_ROOT" merge <task-branch>
          ```
          (Replace `$MAIN_ROOT` with the owning worktree's path from
          `git worktree list --porcelain` when the integration branch lives
-         elsewhere.) Pull/verify there (step 6), never here.
+         elsewhere. Verify there (step 6) — never here.)
     5. Merge: `git merge --ff-only powerflow/<task-slug> || git merge powerflow/<task-slug>`
        (in the worktree from step 4).
        For complex merges, spawn an **Integrator** subagent instead — it executes the
@@ -193,10 +196,16 @@ Which option?
        overlapping merges.
     6. Run tiered verification (Section 2) on the MERGED result (in the same
        worktree as the merge).
-    7. Only on success: delete the task branch (`git branch -d powerflow/<task-slug>`),
-       then proceed to worktree cleanup (Section 7) if in a worktree.
-    8. On verification failure: STOP, keep the task branch, present the failure.
-       The branch must still exist — never delete before verification passes.
+    7. Only on success, in this order:
+       1. Clean up the worktree that was holding the task branch (Section 7) —
+          the task branch cannot be deleted while a worktree has it checked
+          out. If the merge worktree is ephemeral, remove it too.
+       2. Then delete the task branch (`git branch -d powerflow/<task-slug>`,
+          or `-D` when squash made it non-ancestor).
+       In the main checkout (no worktree involved): delete the task branch
+       directly.
+    8. On verification failure: STOP, keep the task branch AND the worktree,
+       present the failure. Never delete before verification passes.
 - **Option 2 (Push & PR)**:
   - Run `git push -u origin <feature-or-powerflow-branch>`.
   - Provide the push status / PR creation link to the user.
@@ -223,7 +232,10 @@ Which option?
 
 ## 7. Worktree Cleanup
 
-If Option 1 or 4 was chosen and the session runs in an ephemeral worktree under `.worktrees/` or `worktrees/`:
+If Option 1 or 4 was chosen and the session runs in an ephemeral worktree under
+`.worktrees/` or `worktrees/` (Option 1 runs this BEFORE deleting the task
+branch — a branch held by a worktree cannot be deleted; Option 4 already
+removed the worktree in Section 6):
 
 1. Derive the worktree path (never assume a variable is set):
    ```bash
@@ -242,6 +254,7 @@ If Option 1 or 4 was chosen and the session runs in an ephemeral worktree under 
    git worktree remove "$WORKTREE_PATH"
    git worktree prune
    ```
+   Then, for Option 1, delete the task branch now that no worktree holds it.
 
 ## 8. Closeout
 
