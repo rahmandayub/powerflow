@@ -8,13 +8,18 @@ set -euo pipefail
 # the task branch is deleted).
 #
 # Usage:
-#   resolve-integration-branch.sh (--base-ref <ref> [--base-branch <name>] | --task-dir <dir>)
+#   resolve-integration-branch.sh (--base-ref <ref> | --task-dir <dir>)
+# (--base-branch is accepted but ignored, for backward compat.)
 #
 # Rules (in order):
-#   1. If the ref resolves to a LOCAL branch, that branch is the answer.
-#   2. If it is a remote-tracking ref <remote>/<branch> and a local <branch>
-#      exists tracking that same remote ref, the local branch is the answer.
-#   3. If it is a remote-tracking ref and no local branch tracks it, FAIL
+#   1. If the ref is REMOTE-QUALIFIED (<remote>/<branch>) and
+#      refs/remotes/<ref> exists, the REMOTE identity wins: a local branch
+#      that merely shares the slash-name (legal in Git) must never shadow
+#      it. Answer = the local branch tracking that exact remote ref, else
+#      FAIL (exit 3).
+#   2. If the ref names a LOCAL branch (short name, no remote match), that
+#      branch is the answer.
+#   3. If it is a remote-tracking ref with no local branch tracking it, FAIL
 #      (exit 3): the orchestrator must create or choose a local integration
 #      branch explicitly (or stop and ask the user). Never auto-create.
 #   4. Otherwise FAIL (exit 1): unknown ref.
@@ -34,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     --base-branch) BASE_BRANCH_ARG="$2"; shift 2 ;;
     --task-dir) TASK_DIR="$2"; shift 2 ;;
     --porcelain) PORCELAIN_OUT=true; shift ;;
-    *) echo "Usage: resolve-integration-branch.sh (--base-ref <ref> [--base-branch <name>] | --task-dir <dir>) [--porcelain]" >&2; exit 1 ;;
+    *) echo "Usage: resolve-integration-branch.sh (--base-ref <ref> | --task-dir <dir>) [--porcelain]" >&2; exit 1 ;;
   esac
 done
 
@@ -59,36 +64,46 @@ if [ -z "$BASE_REF" ]; then
   exit 1
 fi
 
-# 1. Ref names a local branch directly.
-if git show-ref --verify --quiet "refs/heads/$BASE_REF"; then
-  RESULT="$BASE_REF"
-  echo "Integration branch: $RESULT (Base ref is a local branch)" >&2
-# 2/3. Remote-tracking ref <remote>/<branch>: need a LOCAL branch for it.
-elif git show-ref --verify --quiet "refs/remotes/$BASE_REF"; then
-  SHORT=$(printf '%s' "$BASE_REF" | sed -E 's|^[^/]+/||')
+# Remote identity first: a remote-qualified Base ref (upstream/main) must
+# resolve via refs/remotes/ BEFORE any same-named local branch is even
+# considered — a local branch literally named "upstream/main" is legal in Git
+# and must never shadow the recorded remote source.
+if git show-ref --verify --quiet "refs/remotes/$BASE_REF"; then
+  # Canonical remote ref (ambiguity-proof: a same-named local branch makes
+  # short forms ambiguous, so compare full refnames). Guard against empty
+  # output: rev-parse may exit 0 with nothing on ambiguous names.
+  WANT=$(git rev-parse --symbolic-full-name "$BASE_REF" 2>/dev/null || true)
+  if [ -z "$WANT" ]; then
+    WANT="refs/remotes/$BASE_REF"
+  fi
   TRACKING_LOCAL=""
-  # A local branch tracking exactly this remote ref?
+  # A local branch tracking exactly this remote ref? Use full refnames on
+  # both sides (short upstream names are ambiguous under collisions), and
+  # skip branches without an upstream (empty UP must never equal WANT).
   while IFS= read -r lb; do
-    UP=$(git rev-parse --abbrev-ref --symbolic-full-name "$lb@{u}" 2>/dev/null || true)
-    if [ "$UP" = "$BASE_REF" ]; then
+    UP=$(git rev-parse --symbolic-full-name "$lb@{u}" 2>/dev/null || true)
+    if [ -n "$UP" ] && [ "$UP" = "$WANT" ]; then
       TRACKING_LOCAL="$lb"
       break
     fi
-  done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+  done < <(git for-each-ref --format='%(refname)' refs/heads/ | sed -E 's|^refs/heads/||')
   if [ -n "$TRACKING_LOCAL" ]; then
     RESULT="$TRACKING_LOCAL"
     echo "Integration branch: $RESULT (tracks $BASE_REF)" >&2
-  elif git show-ref --verify --quiet "refs/heads/$SHORT" && [ -z "$BASE_BRANCH_ARG" ]; then
-    # A same-named local branch exists but tracks something else (or
-    # nothing): ambiguous — refuse rather than merge into the wrong line.
-    echo "Error: Base ref $BASE_REF has no local tracking branch, and local '$SHORT' does not track it." >&2
-    echo "Create one (git checkout -b <name> --track $BASE_REF) or choose the integration branch explicitly." >&2
-    exit 3
   else
-    echo "Error: Base ref $BASE_REF is remote-tracking with no local branch tracking it." >&2
+    SHORT=$(printf '%s' "$BASE_REF" | sed -E 's|^[^/]+/||')
+    if git show-ref --verify --quiet "refs/heads/$SHORT"; then
+      echo "Error: Base ref $BASE_REF is remote-tracking with no local branch tracking it (local '$SHORT' does not track it)." >&2
+    else
+      echo "Error: Base ref $BASE_REF is remote-tracking with no local branch tracking it." >&2
+    fi
     echo "Create one (git checkout -b <name> --track $BASE_REF) or choose the integration branch explicitly." >&2
     exit 3
   fi
+# Short ref naming a local branch directly.
+elif git show-ref --verify --quiet "refs/heads/$BASE_REF"; then
+  RESULT="$BASE_REF"
+  echo "Integration branch: $RESULT (Base ref is a local branch)" >&2
 else
   echo "Error: base ref '$BASE_REF' not found (no local branch or remote-tracking ref)." >&2
   exit 1

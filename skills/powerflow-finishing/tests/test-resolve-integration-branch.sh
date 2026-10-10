@@ -61,6 +61,43 @@ TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 assert_exit "resolve-unknown" 1 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
+# 5b. Name collision: local branch literally named "upstream/main" PLUS a
+#     remote-tracking upstream/main at a DIFFERENT commit. Remote identity
+#     wins: with no local branch tracking the remote ref -> exit 3 (never
+#     pick the slash-named local branch).
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" remote add upstream /dev/null
+git -C "$TMP" checkout -qb tmp-up
+printf 'u' > "$TMP/u.txt"; git -C "$TMP" add u.txt; git -C "$TMP" commit -qm up
+git -C "$TMP" update-ref refs/remotes/upstream/main HEAD
+git -C "$TMP" checkout -q main
+git -C "$TMP" branch -D tmp-up
+git -C "$TMP" checkout -qb upstream/main
+printf 'local' > "$TMP/local.txt"; git -C "$TMP" add local.txt; git -C "$TMP" commit -qm local-slash
+git -C "$TMP" checkout -q main
+(cd "$TMP" && bash "$RESOLVE" --base-ref upstream/main --porcelain >/dev/null 2>&1); CODE=$?
+assert_exit "resolve-collision-refused" 3 "$CODE"
+rm -rf "$TMP"; trap - EXIT
+
+# 5c. Same collision, but a local branch tracks the remote ref -> that branch
+#     wins over the slash-named local branch.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" remote add upstream /dev/null
+git -C "$TMP" checkout -qb tmp-up
+printf 'u' > "$TMP/u.txt"; git -C "$TMP" add u.txt; git -C "$TMP" commit -qm up
+git -C "$TMP" update-ref refs/remotes/upstream/main HEAD
+git -C "$TMP" checkout -q main
+git -C "$TMP" branch -D tmp-up
+git -C "$TMP" checkout -qb upstream/main
+printf 'local' > "$TMP/local.txt"; git -C "$TMP" add local.txt; git -C "$TMP" commit -qm local-slash
+git -C "$TMP" checkout -qb my-main refs/remotes/upstream/main
+git -C "$TMP" branch --set-upstream-to=upstream/main 2>/dev/null
+git -C "$TMP" checkout -q main
+OUT=$(cd "$TMP" && bash "$RESOLVE" --base-ref upstream/main --porcelain 2>/dev/null); CODE=$?
+assert_exit "resolve-collision-tracking" 0 "$CODE"
+assert_contains "resolve-collision-branch" "$OUT" "^INTEGRATION_BRANCH=my-main$"
+rm -rf "$TMP"; trap - EXIT
+
 # 6. --task-dir reads Base ref from summary.md.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/task"

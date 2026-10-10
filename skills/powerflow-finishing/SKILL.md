@@ -169,17 +169,30 @@ Which option?
   - If working on a `powerflow/<slug>` branch:
     1. Run the Preflight (Section 4).
     2. Ensure changes are committed.
-    3. Resolve the integration branch (Section 3, step 2) and checkout THAT
-       local branch — never `git checkout <Base ref>` directly when the ref is
-       remote-tracking. Confirm attached: `git symbolic-ref -q HEAD`.
-    4. Pull latest (or record "offline, skipped pull"). For a branch tracking
-       a non-origin remote, pull from its own upstream (`git pull` follows the
-       tracking config — do not assume `origin`).
-    5. Merge: `git merge --ff-only powerflow/<task-slug> || git merge powerflow/<task-slug>`.
+    3. Resolve the integration branch (Section 3, step 2).
+    4. Locate the merge:
+       - **Main checkout** (current worktree already on, or free to checkout,
+         the integration branch): checkout the integration branch there,
+         confirm attached (`git symbolic-ref -q HEAD`), pull latest (or record
+         "offline, skipped pull"; pull follows the branch's own tracking —
+         do not assume `origin`), then merge.
+       - **Task worktree** (integration branch checked out in ANOTHER
+         worktree, so this worktree cannot take it): do NOT checkout — run
+         the merge in the worktree that owns the integration branch:
+         ```bash
+         MAIN_ROOT=$(git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel)
+         git -C "$MAIN_ROOT" merge --ff-only <task-branch> || git -C "$MAIN_ROOT" merge <task-branch>
+         ```
+         (Replace `$MAIN_ROOT` with the owning worktree's path from
+         `git worktree list --porcelain` when the integration branch lives
+         elsewhere.) Pull/verify there (step 6), never here.
+    5. Merge: `git merge --ff-only powerflow/<task-slug> || git merge powerflow/<task-slug>`
+       (in the worktree from step 4).
        For complex merges, spawn an **Integrator** subagent instead — it executes the
        merge + verification; the orchestrator only coordinates choices. Never run two
        overlapping merges.
-    6. Run tiered verification (Section 2) on the MERGED result.
+    6. Run tiered verification (Section 2) on the MERGED result (in the same
+       worktree as the merge).
     7. Only on success: delete the task branch (`git branch -d powerflow/<task-slug>`),
        then proceed to worktree cleanup (Section 7) if in a worktree.
     8. On verification failure: STOP, keep the task branch, present the failure.
@@ -195,11 +208,18 @@ Which option?
   - Ask for explicit confirmation:
     > "This will permanently delete branch <name> and all changes. Type 'discard' to confirm."
   - Once confirmed:
-    1. Run the Preflight (Section 4) and save the recovery SHA.
-    2. Checkout the integration branch (Section 3, step 2 — a local branch,
-       never a remote-tracking ref).
-    3. Delete the feature branch (`git branch -D <feature-branch>`).
-    4. Remove the worktree (Section 7) if applicable.
+    1. Run the Preflight (Section 4) and save the recovery SHA (branch name +
+       SHA — the branch CANNOT be deleted while a worktree has it checked out).
+    2. If the task branch is checked out in a worktree (this one or another):
+       remove THAT worktree first (`git worktree remove <path>` from the main
+       repo; `--force` only with a saved recovery SHA), THEN delete the branch
+       (`git branch -D <feature-branch>`) from the main repository location.
+       Never delete a branch out from under its worktree.
+    3. If in the main checkout (no worktree holds either branch): checkout the
+       integration branch (Section 3, step 2 — a local branch, never a
+       remote-tracking ref), then delete the feature branch.
+    4. Remove the worktree (Section 7) if applicable (already done in step 2
+       when the worktree held the task branch).
 
 ## 7. Worktree Cleanup
 
