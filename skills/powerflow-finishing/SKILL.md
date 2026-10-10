@@ -170,41 +170,45 @@ Which option?
     1. Run the Preflight (Section 4).
     2. Ensure changes are committed.
     3. Resolve the integration branch (Section 3, step 2).
-    4. Sync the integration branch BEFORE merging (same contract for both
-       locations in step 5):
-       - If the branch has an upstream (`git -C <loc> rev-parse --abbrev-ref --symbolic-full-name '@{u}'`
+    4. Locate the worktree that owns the integration branch and put it on
+       that branch FIRST (sync must never run on the wrong branch). Call that
+       worktree `<loc>` (the main checkout, or the owning worktree found via
+       `git worktree list --porcelain`):
+       - **Main checkout** (current worktree already on, or free to checkout,
+         the integration branch): checkout the integration branch, confirm
+         attached (`git symbolic-ref -q HEAD`).
+       - **Task worktree** (integration branch checked out in ANOTHER
+         worktree, so this worktree cannot take it): do NOT checkout — take
+         the owning worktree's path from `git worktree list --porcelain`
+         and VERIFY it is on the integration branch and not detached:
+         ```bash
+         OWNER=<owning worktree path>
+         git -C "$OWNER" symbolic-ref -q HEAD >/dev/null || { echo "detached"; exit 1; }
+         test "$(git -C "$OWNER" rev-parse --abbrev-ref HEAD)" = "<integration-branch>" || { echo "wrong branch"; exit 1; }
+         ```
+         `<loc>` is then `$OWNER` — every following command uses
+         `git -C "$OWNER"`, never bare `git` from the task worktree.
+    5. Sync the integration branch IN `<loc>` (never on the task worktree,
+       never on a stray branch):
+       - If it has an upstream (`git -C <loc> rev-parse --abbrev-ref --symbolic-full-name '@{u}'`
          succeeds): run `git -C <loc> pull --ff-only`.
          - On FAILURE: STOP and report. A failed pull (divergence, conflicts,
            unreachable remote) is NOT consent to skip — never continue offline
            without a NEW explicit user decision.
-       - If the branch has NO upstream: ask the user whether to skip the pull,
-         or record an explicit decision to skip in `summary.md` before
+       - If it has NO upstream: ask the user whether to skip the pull, or
+         record an explicit decision to skip in `summary.md` before
          continuing.
        - When the user chooses offline: record it verbatim in `summary.md`
          (e.g. `offline, skipped pull — <date>`) before proceeding.
-    5. Locate the merge and merge there:
-       - **Main checkout** (current worktree already on, or free to checkout,
-         the integration branch): checkout the integration branch, confirm
-         attached (`git symbolic-ref -q HEAD`), then merge.
-       - **Task worktree** (integration branch checked out in ANOTHER
-         worktree, so this worktree cannot take it): do NOT checkout — run
-         the sync (step 4) and merge in the worktree that owns the
-         integration branch:
-         ```bash
-         MAIN_ROOT=$(git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel)
-         git -C "$MAIN_ROOT" merge --ff-only <task-branch> || git -C "$MAIN_ROOT" merge <task-branch>
-         ```
-         (Replace `$MAIN_ROOT` with the owning worktree's path from
-         `git worktree list --porcelain` when the integration branch lives
-         elsewhere. Verify there (step 6) — never here.)
-       Merge command: `git merge --ff-only powerflow/<task-slug> || git merge powerflow/<task-slug>`
-       (in the chosen worktree).
+    6. Merge the task branch in `<loc>`:
+       `git -C <loc> merge --ff-only powerflow/<task-slug> || git -C <loc> merge powerflow/<task-slug>`
+       (in the main checkout `<loc>` is simply the repo root).
        For complex merges, spawn an **Integrator** subagent instead — it executes the
-       sync + merge + verification; the orchestrator only coordinates choices. Never
-       run two overlapping merges.
-    6. Run tiered verification (Section 2) on the MERGED result (in the same
+       checkout + sync + merge + verification; the orchestrator only coordinates
+       choices. Never run two overlapping merges.
+    7. Run tiered verification (Section 2) on the MERGED result (in the same
        worktree as the merge).
-    7. Only on success, in this order:
+    8. Only on success, in this order:
        1. Clean up the worktree that was holding the task branch (Section 7) —
           the task branch cannot be deleted while a worktree has it checked
           out. If the merge worktree is ephemeral, remove it too.
@@ -212,7 +216,7 @@ Which option?
           or `-D` when squash made it non-ancestor).
        In the main checkout (no worktree involved): delete the task branch
        directly.
-    8. On verification failure: STOP, keep the task branch AND the worktree,
+    9. On verification failure: STOP, keep the task branch AND the worktree,
        present the failure. Never delete before verification passes.
 - **Option 2 (Push & PR)**:
   - Run `git push -u origin <feature-or-powerflow-branch>`.

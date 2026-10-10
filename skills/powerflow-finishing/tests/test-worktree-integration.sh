@@ -75,4 +75,21 @@ assert_exit "worktree-resolve-inside" 0 "$CODE"
 assert_contains "worktree-resolve-inside-branch" "$OUT" "^INTEGRATION_BRANCH=main$"
 trap - EXIT; git -C "$TMP_MAIN" worktree remove --force "$TMP_WT" 2>/dev/null; rm -rf "$TMP_MAIN"
 
+# 4. Pre-check contract (SKILL step 4): the owning worktree must be ON the
+#    integration branch and NOT detached before sync/merge proceed.
+read -r TMP_MAIN TMP_WT < <(make_worktree_task); trap 'git -C "$TMP_MAIN" worktree remove --force "$TMP_WT" 2>/dev/null; rm -rf "$TMP_MAIN"' EXIT
+# Owning worktree parked on the WRONG branch -> pre-check must fail.
+git -C "$TMP_MAIN" checkout -qb other >/dev/null 2>&1
+(git -C "$TMP_MAIN" symbolic-ref -q HEAD >/dev/null && test "$(git -C "$TMP_MAIN" rev-parse --abbrev-ref HEAD)" = "main") >/dev/null 2>&1; CODE=$?
+[ "$CODE" -ne 0 ] && pass "worktree-precheck-wrong-branch" || fail "worktree-precheck-wrong-branch" "wrong branch passed pre-check"
+# Owning worktree DETACHED -> pre-check must fail.
+git -C "$TMP_MAIN" checkout -q --detach >/dev/null 2>&1
+(git -C "$TMP_MAIN" symbolic-ref -q HEAD >/dev/null) ; CODE=$?
+[ "$CODE" -ne 0 ] && pass "worktree-precheck-detached" || fail "worktree-precheck-detached" "detached passed pre-check"
+# Back on main -> pre-check passes.
+git -C "$TMP_MAIN" checkout -q main >/dev/null 2>&1
+(git -C "$TMP_MAIN" symbolic-ref -q HEAD >/dev/null && test "$(git -C "$TMP_MAIN" rev-parse --abbrev-ref HEAD)" = "main") >/dev/null 2>&1; CODE=$?
+assert_exit "worktree-precheck-ok" 0 "$CODE"
+trap - EXIT; git -C "$TMP_MAIN" worktree remove --force "$TMP_WT" 2>/dev/null; rm -rf "$TMP_MAIN"
+
 summary_of
