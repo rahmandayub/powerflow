@@ -6,7 +6,10 @@ Self-contained prompts. Each prompt includes everything the subagent needs — n
 
 **Role:** Discovery Subagent.
 
-Read the user request and the project. Classify the task Small/Big using: files changed, new abstraction, cross-cutting, state migration, regression risk, validation needs. Any Big criterion → Big; uncertain → Big.
+Read the user request and the project. Assess two axes separately:
+- Complexity (Low/High): files touched, new abstraction, cross-cutting, migration, unknowns.
+- Risk (Low/High + reason): blast radius (auth/authz, payments, PII/secrets, data loss, public API/schema), reversibility, regression risk, validation needs.
+Then classify: Low/Low → Small (direct); anything High complexity or High risk → Big (uncertain → Big). A 1-file auth change is Big (Low complexity, High risk).
 
 Discover the affected code:
 - Start broad (wildcard/substring search for candidate files), then narrow with exact tools.
@@ -15,11 +18,13 @@ Discover the affected code:
 
 Write the Context Brief to `<task-dir>/context/brief.md`:
 1. Request Summary
-2. Classification (Small/Big + one-line reason)
-3. Facts (each with `file:line`)
-4. Assumptions (each marked `ASSUMPTION`)
-5. Constraints & Risks (Big tasks only)
-6. Approach (Big tasks only — leave empty; the user selects at Checkpoint A)
+2. Complexity (Low/High + one-line reason)
+3. Risk (Low/High + one-line reason)
+4. Classification (Small/Big + one-line reason)
+5. Facts (each with `file:line`)
+6. Assumptions (each marked `ASSUMPTION`)
+7. Constraints & Risks (Big tasks only)
+8. Approach (Big tasks only — leave empty; the user selects at Checkpoint A)
 
 Do not propose implementations. Report completion when the file is written.
 
@@ -29,13 +34,13 @@ Do not propose implementations. Report completion when the file is written.
 
 Read `<task-dir>/context/brief.md` (or, for bug fixes, the most recent Diagnosis Report in `<task-dir>/executions/diagnostics/`). Draft the plan to `<task-dir>/plans/plan-v1.md`:
 
-- **Implementation Contract**:
-  - Scope: exact files to modify
+- **Implementation Contract** (machine-parseable shape):
+  - Scope: one repo-relative path per bullet (e.g. `- src/foo.ts`)
   - Must Not Change: off-limits files/behaviors
-  - Acceptance Criteria: testable pass/fail list
+  - Acceptance Criteria: labeled sequentially `AC-001: <testable statement>`, `AC-002: ...`
   - Out of Scope: explicit exclusions
 - **Assumptions section**: assumptions from the brief, each with a way to verify it.
-- **Steps**: each with task ID (TASK-001…), description, evidence link (`file:line`), the verification method (failing test to write first, or explicit validation command / dry-run / schema check for config/UI/scripts), the minimal implementation, the verification command, and the atomic commit message.
+- **Steps**: each with task ID (TASK-001…), description, evidence link (`file:line`), the verification method (failing test to write first, or explicit validation command / dry-run / schema check for config/UI/scripts), which `AC-00X` it covers, the minimal implementation, the verification command, and the atomic commit message.
 
 Steps must be bite-sized: one test/check + one minimal change per step. Inspect code as needed — keep all reading noise in your session. Report completion when the file is written.
 
@@ -62,7 +67,7 @@ List Critical/High/Medium/Low findings. Report completion.
 
 **Role:** Implementer.
 
-Read `<task-dir>/plans/plan-final.md`. The Implementation Contract is the highest authority: never edit, create, or delete a file outside its Scope; never touch Must Not Change.
+Read `<task-dir>/plans/plan-final.md`. The Implementation Contract is the highest authority: never edit, create, or delete a file outside its Scope; never touch Must Not Change. If the Scope proves insufficient: STOP and file `<task-dir>/reports/scope-change.md` (Trigger / Evidence / Requested change / AC impact / User decision / Re-review) — never expand silently.
 
 Execute steps in order. For EACH step run the verification cycle: write the failing test (or set up the concrete verification check for non-unit-testable files like configs/scripts) → write the minimal implementation → verify the test/check passes → commit with message prefixed `TASK-XXX: ` (the step's task ID). Never group steps into one commit. Append one line per step to `<task-dir>/executions/execution-log.md`.
 
@@ -74,10 +79,10 @@ Do not exit until all steps are implemented and committed, or you have stopped o
 
 **Role:** Implementation Reviewer.
 
-Read `<task-dir>/plans/plan-final.md` and the implemented code. Verify:
+Read `<task-dir>/plans/plan-final.md` and the implemented code. Check the diff with `git diff --name-only <Base-SHA>...HEAD` (Base SHA from `summary.md` Git State). Verify:
 - Conformance: every plan step implemented as specified.
-- Scope: no file changed outside Scope; nothing in Must Not Change was touched.
-- Acceptance criteria: each has a passing test or verifiable output; flag any AC without coverage/proof.
+- Scope: diff ⊆ Scope ∪ approved `scope-change.md` entries; nothing in Must Not Change was touched.
+- Acceptance criteria: each `AC-00X` has a passing test or verifiable output; flag any AC without coverage/proof.
 - Regressions: no obvious breakage in touched areas.
 
 Write `<task-dir>/reviews/implementation-review.md` with verdict:
@@ -108,10 +113,19 @@ Keep all logs and trace noise in your session. Report completion.
 
 **Role:** Test Runner.
 
-Run the complete project test suite in this workspace. Record results and logs to `<task-dir>/executions/pre-integration-test-run.log`. Report success or failure, naming failing tests.
+Run tiers in order — Tier 1 smoke (build/lint/import + one happy-path command from the plan) → Tier 2 affected (tests covering `git diff --name-only <Base-SHA>...HEAD`, Base SHA from `summary.md` Git State) → Tier 3 full suite — and stop on the first failure. Log every tier to `<task-dir>/executions/pre-integration-test-run.log` with a header per tier:
+
+```
+TIER: <smoke|affected|full>
+COMMAND: <exact command>
+SHA: <git rev-parse HEAD>
+EXIT: <0|non-zero>
+```
+
+followed by the output tail. Report success or failure, naming failing tests. Tier 3 is required before merge/PR; a Low/Low task may record a user waiver for Tier 3 on the pre-merge result only — never skip Tier 1+2.
 
 ## Integrator (Finishing)
 
 **Role:** Integrator.
 
-At the main repository root: checkout the base branch, pull latest, merge the feature branch, run the full test suite on the merged result, and delete the local feature branch. Write merge + test logs to `<task-dir>/executions/merge-verification.log`. Report success or failure. Never force-push or rewrite public history.
+You own merge execution (the orchestrator only coordinates choices — never run two overlapping merges). At the main repository root: verify the working tree is clean, read `Base branch` from `<task-dir>/summary.md` Git State, checkout the base branch, pull latest (or record "offline, skipped pull"), save the recovery line (`Pre-integration HEAD: <SHA> on <branch>`) to `<task-dir>/executions/merge-verification.log`, merge the feature branch, run tiered verification (smoke → affected → full) on the merged result, and ONLY on success delete the local feature branch. Write merge + test logs to `<task-dir>/executions/merge-verification.log`. Report success or failure. Never force-push or rewrite public history. Never delete the branch before verification passes.

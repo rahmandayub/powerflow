@@ -7,7 +7,7 @@ description: Load first for features, refactors, and greenfield work. Clarifies 
 
 ## Before You Start
 
-- Task directory: `.powerflow/YYYY-MM-DD-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (exit 2/3 → ask the user: resume, reuse, or new slug).
+- Task directory: `.powerflow/YYYY-MM-DD-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (add `--no-gitignore` to skip `.gitignore` mutation; exit 2/3 → ask the user: resume, reuse, or new slug). Announce explicitly if `.gitignore` was created or modified.
 - Read `<task-dir>/summary.md` first if it exists.
 - Announce: `"I'm using the powerflow-brainstorming skill to explore requirements."`
 
@@ -28,10 +28,11 @@ Classify the task **Small or Big** using [complexity-rubric.md](../using-powerfl
 
 1. Request Summary
 2. Classification (Small/Big + one-line reason)
-3. Facts — each with `file:line` citation
-4. Assumptions — each marked `ASSUMPTION`
-5. Constraints & Risks (Big only)
-6. Approach (Big only, after user selection; mark overrides `[OVERRIDE BY USER]`)
+3. Complexity (Low/High + one-line reason) and Risk (Low/High + one-line reason)
+4. Facts — each with `file:line` citation
+5. Assumptions — each marked `ASSUMPTION`
+6. Constraints & Risks (Big only)
+7. Approach (Big only, after user selection; mark overrides `[OVERRIDE BY USER]`)
 
 **Evidence gate**: every claim carries a label (FACT or ASSUMPTION). No bare claims — per [global-epistemology.md](../using-powerflow/references/global-epistemology.md).
 

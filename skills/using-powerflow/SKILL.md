@@ -45,9 +45,9 @@ Cross-skill paths (e.g. `using-powerflow/references/complexity-rubric.md`) resol
 2. **Classify every task Small or Big** with [complexity-rubric.md](references/complexity-rubric.md). The classification decides delegation and reviews.
 
 3. **Delegation rule**:
-   - **Big tasks**: delegate codebase discovery, plan drafting, implementation, and reviews to subagents (registry below). The orchestrator handles only decisions, user communication, reading `<task-dir>` files, and git operations.
+   - **Big tasks**: delegate codebase discovery, plan drafting, implementation, and reviews to subagents (registry below). The orchestrator handles only decisions, user communication, reading `<task-dir>` files, and git operations. Low-complexity/High-risk tasks (e.g. a 1-file auth change) still get tightened planning and independent review proportionate to risk.
    - **Small tasks**: the orchestrator may search, read, edit, and test directly. No subagent reviews. After implementation, run the one-line scope check: list the files changed and confirm every one is in the plan's scope.
-   - **Mid-Flight Escalation**: if a Small task expands in scope (>2 files, schema changes, new modules) during execution, immediately stop, reclassify as Big in `summary.md`, and transition to Planning.
+   - **Mid-Flight Escalation**: if a Small task expands in scope (>2 files, schema changes, new modules) or rises in risk (auth/payment/migration touched, blast radius grows) during execution, immediately stop, reclassify as Big in `summary.md`, and transition to Planning.
 
 4. **Evidence rule**: two labels only — `FACT` (with `file:line`) and `ASSUMPTION` (always marked). Every claim in `brief.md` carries one label; bare claims are rewritten. Full rule: [global-epistemology.md](references/global-epistemology.md).
 
@@ -96,10 +96,20 @@ Done: <one-line result>
 Output: <paths>
 User decisions: <verbatim, with date — e.g. "2026-07-05: chose approach B (reason: X)">
 Next: <next phase>
+
+## Git State (mandatory from Executing onward)
+- Base branch: <name, e.g. main>
+- Base SHA: <40-char SHA of base at isolation>
+- Task branch: <powerflow/<slug> or existing branch>
+- Isolation: created|reused|detached — <YYYY-MM-DD>
 ```
 
 - Record user decisions verbatim with the date. Settled decisions are not reopened.
 - If a decision later changes, append a new line; never edit the old one.
+- Git State rule: the branch the session started on is NOT necessarily the base.
+  Base is the isolation source recorded by `isolate-branch.sh --porcelain` at isolate
+  time. Executing writes all four fields; Finishing READS them, never re-derives;
+  `validate-transition.sh` uses Base branch/SHA as source of truth.
 
 ---
 

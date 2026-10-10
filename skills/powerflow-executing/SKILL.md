@@ -7,24 +7,28 @@ description: Load when an approved plan exists. Implements Small tasks directly 
 
 ## Before You Start
 
-- Task directory: `.powerflow/YYYY-MM-DD-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (exit 2/3 → ask the user).
+- Task directory: `.powerflow/YYYY-MM-DD-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (add `--no-gitignore` to skip `.gitignore` mutation; exit 2/3 → ask the user). Announce explicitly if `.gitignore` was created or modified.
 - Read `<task-dir>/summary.md` first if it exists, then the approved Final Plan at `<task-dir>/plans/plan-final.md`.
 - Extract the **Implementation Contract** — it is the highest authority; do not violate it.
 - Announce: `"I'm using the powerflow-executing skill to implement the approved plan."`
 
 ## 1. Branch Isolation
 
-1. Record the current branch in `summary.md` (the finishing phase needs it).
-2. Run: `bash <skills-root>/powerflow-executing/scripts/isolate-branch.sh --task-slug <task-slug>`
+1. Run with porcelain output to capture the Git State:
+   `bash <skills-root>/powerflow-executing/scripts/isolate-branch.sh --task-slug <task-slug> [--base-branch <known-base>] --porcelain`
    - Exit 0 → proceed.
    - Exit 1 → error: report it and stop.
-   - Exit 2 → detached HEAD: warn the user before continuing.
-3. Record the resulting branch in `summary.md` (`powerflow/<slug>` or the existing branch).
+   - Exit 2 → detached HEAD: warn the user and use the detached-HEAD finishing menu; do not create a branch.
+   - Exit 4 → dirty tree: STOP, ask the user to commit/stash or re-run with `--allow-dirty`.
+2. Write all four Git State fields to `summary.md` from the `--porcelain` output
+   (`BASE_BRANCH` → Base branch, `BASE_SHA` → Base SHA, `TASK_BRANCH` → Task branch,
+   plus `Isolation: <ACTION> — <date>`). The branch the session started on is NOT
+   necessarily the base — record them as separate fields; Finishing needs the base.
 
 ## 2. Implement
 
 - **Small**: implement directly. Write tests for non-trivial logic (or run concrete verification commands for non-testable code/config/scripts), verify, and commit.
-  - **Mid-Flight Escalation**: if during execution the scope unexpectedly expands (>2 files, new abstractions, schema migrations, cross-cutting dependencies), STOP direct editing immediately, update classification to `Big` in `summary.md`, and transition to [powerflow-planning](../powerflow-planning/SKILL.md).
+  - **Mid-Flight Escalation**: if during execution the scope unexpectedly expands (>2 files, new abstractions, schema migrations, cross-cutting dependencies) or risk rises (auth/payment/migration touched, blast radius grows, reversibility drops, regression risk revised up), STOP direct editing immediately, update classification to `Big` in `summary.md` (noting which axis changed), and transition to [powerflow-planning](../powerflow-planning/SKILL.md).
   - After the last edit, run the **one-line scope check**: list the files changed and confirm each is in the contract's Scope. No subagent reviews.
 - **Big**: spawn a subagent using the **Implementer** prompt from [subagent-prompts.md](../using-powerflow/references/subagent-prompts.md). It executes steps task-by-task (failing test / concrete verification step → minimal implementation → test passes → atomic commit `TASK-XXX: ...`), appends to `<task-dir>/executions/execution-log.md`, and stops on failure.
 
@@ -43,14 +47,21 @@ Spawn a subagent using the **Implementation Reviewer** prompt. It writes `<task-
 
 ## 5. Verification
 
-- **Big**: append a short verification section to `<task-dir>/executions/verification-ledger.md`: files modified, tests run and results, acceptance criteria pass/fail with evidence, review verdicts.
-- **Small**: no ledger needed — the scope check result is enough.
+- **Big**: append a short verification section to `<task-dir>/executions/verification-ledger.md`: files modified, tests run and results, acceptance criteria pass/fail with evidence, review verdicts. Record the tested commit as `Tested SHA: <git rev-parse HEAD>` (the validator compares it to HEAD).
+- **Small**: write the scope-check result to `<task-dir>/scope-check.txt`: one line per `AC-00X` with `PASS|FAIL` plus evidence (`file:line` or `log:timestamp`), e.g. `AC-001 PASS src/foo.ts:42`. The validator reads this file for Small tasks (no ledger, no review file by design).
 - Update `summary.md`: phase done, output paths, next phase (Finishing).
 - Show the final diff (e.g. `git diff` against the base branch, or `git log --oneline` of the commits) and announce: `"Implementation complete and verified."`
 
 ## Non-Negotiable Behaviors
 
-- **Scope lock is absolute**: never edit, create, or delete a file outside the contract's Scope. Expanding scope requires the user's OK.
+- **Scope lock with recorded expansion only**: never edit, create, or delete a file
+  outside the contract's Scope. If the scope proves insufficient: STOP, write
+  `<task-dir>/reports/scope-change.md` (Trigger / Evidence `file:line` / Requested
+  change / AC impact / User decision / Re-review), get the user's recorded approval,
+  amend `plan-final.md` (date + added paths + reason), and re-run the appropriate
+  reviewer before resuming. Never expand scope silently. An approved scope-change does
+  NOT reset the 3-round review cap. `validate-transition.sh` accepts out-of-scope
+  diffs only when covered by an approved `scope-change.md`.
 - **Verification cycle per step**: failing test (or concrete command check for non-testable tasks) → minimal implementation → verification passes → atomic commit with the task ID. Never group steps into one commit.
 - **Never self-approve** (Big): implementation and coverage checks are delegated to an independent subagent.
 - **Failure stops the pipeline**: stop and report; never silently patch or skip a failure.

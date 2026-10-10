@@ -7,7 +7,7 @@ description: Load when a Context Brief or Diagnosis Report exists. Writes the im
 
 ## Before You Start
 
-- Task directory: `.powerflow/YYYY-MM-DD-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (exit 2/3 → ask the user).
+- Task directory: `.powerflow/YYYY-MM-DD-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (add `--no-gitignore` to skip `.gitignore` mutation; exit 2/3 → ask the user). Announce explicitly if `.gitignore` was created or modified.
 - Read `<task-dir>/summary.md` first if it exists, then the Context Brief at `<task-dir>/context/brief.md`.
 - Bug fix routed from debugging: if no brief exists, read the most recent Diagnosis Report from `<task-dir>/executions/diagnostics/` instead and treat it as the context document.
 - Announce: `"I'm using the powerflow-planning skill to draft the implementation plan."`
@@ -22,16 +22,18 @@ Spawn a subagent using the **Plan Drafter** prompt from [subagent-prompts.md](..
 
 ### Implementation Contract (in every plan)
 
-- **Scope**: exact files to modify
+Machine-parseable shape (required by `validate-transition.sh`):
+
+- **Scope**: one repo-relative path per bullet (e.g. `- src/foo.ts`)
 - **Must Not Change**: off-limits files/behaviors
-- **Acceptance Criteria**: testable pass/fail list
+- **Acceptance Criteria**: labeled sequentially `AC-001: <testable statement>`, `AC-002: ...`
 - **Out of Scope**: explicit exclusions
 
 ### Plan Structure (Big)
 
 - The contract above
 - Assumptions section (each with a way to verify it)
-- Steps: task ID (TASK-001…), description, evidence link (`file:line`), the verification method (failing test for logic/code, or explicit verification command/schema check/lint for config/UI/scripts), the minimal implementation, the verification command, the atomic commit message
+- Steps: task ID (TASK-001…), description, evidence link (`file:line`), the verification method (failing test for logic/code, or explicit verification command/schema check/lint for config/UI/scripts), which `AC-00X` it covers, the minimal implementation, the verification command, the atomic commit message
 
 ## 3. Checkpoint B (Big)
 
@@ -50,7 +52,19 @@ Spawn a subagent using the **Plan Reviewer** prompt from [subagent-prompts.md](.
 
 1. Write `<task-dir>/plans/plan-final.md` with the `APPROVED` verdict and the full contract + steps.
 2. Update `summary.md`: phase done, output path, next phase (Executing).
-3. Transition to [powerflow-executing](../powerflow-executing/SKILL.md).
+3. Run the transition gate:
+   `bash <skills-root>/using-powerflow/scripts/validate-transition.sh --task-dir <task-dir> --from planning --to executing`
+   On FAIL: do not transition — fix the plan/review/scope-change first.
+4. Transition to [powerflow-executing](../powerflow-executing/SKILL.md).
+
+## Scope Changes After Lock
+
+If executing discovers the Scope is insufficient: STOP, write
+`<task-dir>/reports/scope-change.md` (Trigger / Evidence `file:line` / Requested change
+/ AC impact / User decision: pending|approved YYYY-MM-DD verbatim|rejected / Re-review),
+get the user's recorded approval, append an Amendment log to `plan-final.md` (date +
+added paths + reason), and re-run the Plan Reviewer (abbreviated) before resuming.
+An approved scope-change does NOT reset the 3-round review cap. Never expand silently.
 
 ## Blocker Report Template (`<task-dir>/reports/blocker.md`)
 

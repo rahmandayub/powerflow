@@ -4,12 +4,15 @@ set -euo pipefail
 # Creates the Powerflow task directory. Auto-prepends today's date if the slug
 # lacks a YYYY-MM-DD- prefix.
 # Exit codes: 0 created | 2 exists with content | 3 exists but empty (orphan)
+# --no-gitignore skips all .gitignore mutation (default appends/creates .powerflow/).
 
 TASK_SLUG=""
+NO_GITIGNORE=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --task-slug) TASK_SLUG="$2"; shift 2 ;;
-    *) echo "Usage: init-task-dir.sh --task-slug <slug>" >&2; exit 1 ;;
+    --no-gitignore) NO_GITIGNORE=true; shift ;;
+    *) echo "Usage: init-task-dir.sh --task-slug <slug> [--no-gitignore]" >&2; exit 1 ;;
   esac
 done
 
@@ -37,8 +40,10 @@ fi
 
 mkdir -p "$TASK_DIR"/{context,plans,reviews,executions/diagnostics,reports}
 
-# Ensure .powerflow/ is gitignored
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# Ensure .powerflow/ is gitignored (unless opted out — announce either way)
+if [ "$NO_GITIGNORE" = true ]; then
+  echo "Skipped .gitignore handling (--no-gitignore)." >&2
+elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   GIT_ROOT=$(git rev-parse --show-toplevel)
   GITIGNORE="$GIT_ROOT/.gitignore"
   if [ -f "$GITIGNORE" ]; then
