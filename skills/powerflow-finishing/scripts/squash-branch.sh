@@ -65,34 +65,61 @@ if [ -z "$BASE_BRANCH" ] && [ -n "$TASK_DIR" ]; then
   fi
 fi
 
-if [ -n "$BASE_REF" ]; then
-  # Exact ref wins: verify it directly (local branch, full remote ref, or
-  # <remote>/<branch> shorthand).
-  if git show-ref --verify --quiet "refs/heads/$BASE_REF"     || git show-ref --verify --quiet "refs/remotes/$BASE_REF"     || git rev-parse --verify --quiet "$BASE_REF" >/dev/null; then
-    :
+# Unified ref resolution for BOTH entry paths (--base-branch flag and
+# --task-dir summary): a remote-qualified value (upstream/main) resolves to
+# that exact remote ref; a short name prefers the local branch, then the
+# first remote-tracking match. Squash only needs a merge-base, so remote
+# refs are fine here (unlike checkout/merge in Finishing Section 6).
+resolve_base_ref() { # resolve_base_ref <value> -> echoes ref or fails
+  local v="$1" found
+  # Remote-qualified values (upstream/main) must hit the remote ref, never a
+  # same-named local branch.
+  case "$v" in
+    */*)
+      if git show-ref --verify --quiet "refs/remotes/$v"; then
+        printf '%s' "$v"
+      elif git rev-parse --verify --quiet "$v" >/dev/null; then
+        printf '%s' "$v"
+      else
+        return 1
+      fi
+      return 0
+      ;;
+  esac
+  if git show-ref --verify --quiet "refs/heads/$v"; then
+    printf '%s' "$v"
+  elif git show-ref --verify --quiet "refs/remotes/$v"; then
+    printf '%s' "$v"
+  elif git rev-parse --verify --quiet "$v" >/dev/null; then
+    printf '%s' "$v"
   else
+    found=$(git for-each-ref --format='%(refname:short)' "refs/remotes/*/$v" | head -n 1 || true)
+    if [ -n "$found" ]; then
+      echo "Note: using remote-tracking base $found" >&2
+      printf '%s' "$found"
+    else
+      return 1
+    fi
+  fi
+}
+
+if [ -n "$BASE_REF" ]; then
+  # Exact ref from summary wins; verify it resolves.
+  RESOLVED=$(resolve_base_ref "$BASE_REF") || {
     echo "Error: base ref '$BASE_REF' not found." >&2
     exit 1
-  fi
+  }
+  BASE_REF="$RESOLVED"
 else
   if [ -z "$BASE_BRANCH" ]; then
     echo "Error: base branch ambiguous. Pass --base-branch <branch> or --task-dir <dir>." >&2
     exit 1
   fi
-  # Fallback for summaries without Base ref: prefer local, then any remote.
-  BASE_REF="$BASE_BRANCH"
-  if git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
-    :
-  else
-    FOUND=$(git for-each-ref --format='%(refname:short)' "refs/remotes/*/$BASE_BRANCH" | head -n 1 || true)
-    if [ -n "$FOUND" ]; then
-      echo "Note: using remote-tracking base $FOUND" >&2
-      BASE_REF="$FOUND"
-    else
-      echo "Error: base branch '$BASE_BRANCH' not found (no local branch or remote-tracking ref)" >&2
-      exit 1
-    fi
-  fi
+  # Same resolver for the explicit flag (incl. remote-qualified values).
+  BASE_REF=$(resolve_base_ref "$BASE_BRANCH") || {
+    echo "Error: base branch '$BASE_BRANCH' not found (no local branch or remote-tracking ref)" >&2
+    exit 1
+  }
 fi
 
 # Dirty-tree guard — tracked staged/unstaged changes block the reset.

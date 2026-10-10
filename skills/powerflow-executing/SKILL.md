@@ -76,8 +76,10 @@ Spawn a subagent using the **Implementation Reviewer** prompt. It writes `<task-
   recorded approval, amend `plan-final.md` (date + request ID + added paths + reason),
   and re-run the appropriate reviewer before resuming. Never expand scope silently.
   An approved scope-change does NOT reset the 3-round review cap.
-  `validate-transition.sh` accepts out-of-scope diffs only when covered by the
-  LATEST request block fully completed (approved + amended + re-reviewed ACCEPTED).
+  Effective scope is cumulative: `validate-transition.sh` accepts out-of-scope
+  diffs covered by ANY completed request (approved + amended + re-reviewed
+  ACCEPTED); a newer request never revokes earlier completed paths. The latest
+  request must still be complete (or rejected) before transitioning.
 - **Verification cycle per step**: failing test (or concrete command check for non-testable tasks) → minimal implementation → verification passes → atomic commit with the task ID. Never group steps into one commit.
 - **Never self-approve** (Big): implementation and coverage checks are delegated to an independent subagent.
 - **Failure stops the pipeline**: stop and report; never silently patch or skip a failure.

@@ -313,14 +313,59 @@ scope_change_policy() {
   fi
 }
 
-scope_change_rereview_accepted() { # 0 if the LATEST "Re-review:" line in the latest block says ACCEPTED
-  # Only the newest verdict counts: an ACCEPTED followed by SEND BACK means
-  # the change is NOT reviewed-accepted.
+scope_change_blocks() { # prints "## Request ..." start line numbers, one per line
+  grep -n '^## Request ' "$TASK_DIR/reports/scope-change.md" 2>/dev/null | cut -d: -f1 || true
+}
+
+scope_change_block_at() { # scope_change_block_at <start-line> <end-line|''> -> block text
+  local from="$1" to="$2" file="$TASK_DIR/reports/scope-change.md"
+  if [ -n "$to" ]; then
+    sed -n "${from},$((to - 1))p" "$file"
+  else
+    sed -n "${from},\$p" "$file"
+  fi
+}
+
+block_decision() { # block_decision <block-text> -> approved|pending|rejected|''
+  printf '%s' "$1" | grep -Ei 'user decision[[:space:]]*:' \
+    | tail -n 1 | grep -Eo '(approved|pending|rejected)\b' -i | tr '[:upper:]' '[:lower:]' || true
+}
+
+block_rereview_accepted() { # 0 if the block's LATEST Re-review line says ACCEPTED
   local verdict
-  verdict=$(scope_change_latest_block 2>/dev/null \
-    | grep -Ei 're-review[[:space:]]*:' \
+  verdict=$(printf '%s' "$1" | grep -Ei 're-review[[:space:]]*:' \
     | grep -Eo '\b(ACCEPTED|SEND BACK)\b' | tail -n 1 || true)
   [ "$verdict" = "ACCEPTED" ]
+}
+
+scope_change_rereview_accepted() { # 0 if the LATEST block's LATEST Re-review line says ACCEPTED
+  block_rereview_accepted "$(scope_change_latest_block 2>/dev/null)"
+}
+
+block_plus_paths() { # block_plus_paths <block-text> -> '+' paths, one per line
+  printf '%s' "$1" \
+    | awk '/Requested change/{flag=1; next} /AC impact/{flag=0} flag' \
+    | grep -Eo '^[[:space:]]*\+[[:space:]]+[A-Za-z0-9_./-]+' \
+    | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true
+}
+
+block_id() { # block_id <block-text> -> SC-00X or empty
+  printf '%s' "$1" | head -n 1 | grep -Eo 'SC-[0-9]+' | head -n 1 || true
+}
+
+# 0 if the given request block is COMPLETED: approved + amended (ID/paths) +
+# latest Re-review ACCEPTED. Prints its amended '+' paths on success.
+block_completed_paths() { # block_completed_paths <block-text> -> covered paths
+  local block="$1" decision req_id paths
+  decision=$(block_decision "$block")
+  [ "$decision" = "approved" ] || return 1
+  block_rereview_accepted "$block" || return 1
+  req_id=$(block_id "$block")
+  paths=$(block_plus_paths "$block")
+  [ -n "$paths" ] || return 1
+  plan_amendment_names "$req_id" "$paths" || return 1
+  # shellcheck disable=SC2086
+  amended_paths_only "$req_id" $paths
 }
 
 amendment_text() { # prints the Amendment section(s) for the request: from an Amendment heading naming the ID to the next heading (or EOF); all Amendment sections if legacy
@@ -374,27 +419,27 @@ amended_paths_only() { # amended_paths_only <req_id> <req_paths...> -> covered p
   done
 }
 
-approved_extra_paths() { # prints the LATEST request's '+' paths covered by its amendment
-  # Protocol completion requires ALL of, within the LATEST "## Request" block:
-  # decision approved, the LATEST "Re-review:" line saying ACCEPTED, and an
-  # Amendment section in plan-final.md naming the request ID (or the paths,
-  # for legacy files without Request IDs). Only amended '+' paths are
-  # returned: an amendment naming the ID but omitting a path does NOT cover
-  # that path. '-' bullets are removals and never widen the allowed diff.
+approved_extra_paths() { # prints CUMULATIVE '+' paths from ALL completed requests
+  # Effective scope is cumulative: every request block that is completed
+  # (approved + amended + latest Re-review ACCEPTED) contributes its amended
+  # '+' paths. The LATEST block's own completeness is enforced separately by
+  # scope_change_policy(): a pending/incomplete latest request still blocks
+  # the transition, but it never revokes paths completed by earlier requests.
+  # '-' bullets are removals and never widen the allowed diff.
   local sc="$TASK_DIR/reports/scope-change.md"
   [ -f "$sc" ] || return 0
-  [ "$(scope_change_latest_decision)" = "approved" ] || return 0
-  scope_change_rereview_accepted || return 0
-  local req_id req_paths
-  req_id=$(scope_change_latest_id)
-  req_paths=$(scope_change_latest_block \
-    | awk '/Requested change/{flag=1; next} /AC impact/{flag=0} flag' \
-    | grep -Eo '^[[:space:]]*\+[[:space:]]+[A-Za-z0-9_./-]+' \
-    | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true)
-  [ -n "$req_paths" ] || return 0
-  plan_amendment_names "$req_id" "$req_paths" || return 0
-  # shellcheck disable=SC2086
-  amended_paths_only "$req_id" $req_paths
+  if ! grep -Eq '^## Request ' "$sc"; then
+    # Legacy file without Request IDs: treat as a single block.
+    block_completed_paths "$(cat "$sc")" || return 0
+    return 0
+  fi
+  local starts start next block
+  starts=$(scope_change_blocks)
+  for start in $starts; do
+    next=$(printf '%s\n' "$starts" | awk -v s="$start" '$1 > s { print $1; exit }')
+    block=$(scope_change_block_at "$start" "$next")
+    block_completed_paths "$block" || true
+  done | sort -u
 }
 
 plan_scope_paths() { # prints scope bullet paths from plan-final.md

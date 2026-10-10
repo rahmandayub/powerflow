@@ -7,7 +7,7 @@ description: Load when implementation is complete and verified. Offers commit sq
 
 ## Before You Start
 
-- Read `<task-dir>/summary.md` — it records the Git State (Base branch/SHA, task branch) and phase state.
+- Read `<task-dir>/summary.md` — it records the Git State (Base ref/branch/SHA, task branch) and phase state.
 - Run the transition gate before anything else:
   `bash <skills-root>/using-powerflow/scripts/validate-transition.sh --task-dir <task-dir> --from executing --to finishing`
   On FAIL: STOP and fix (re-review, scope-change completion, or git state) — do not squash, merge, or delete.
@@ -71,7 +71,15 @@ EXIT: <0|non-zero>
 followed by the output tail. If any tier fails: STOP and present the failure summary
 to the user. Do not proceed to integration until resolved.
 
-## 3. Environment & Base Branch Detection
+## 3. Environment & Integration Branch Resolution
+
+Two distinct concepts — never conflate them:
+
+- **Base ref**: the exact integration source recorded at isolate time
+  (`Base ref` in Git State, e.g. `upstream/main`). Used for merge-base,
+  diff-scope, and squash. Read-only.
+- **Integration branch**: the LOCAL branch that receives the merge. Merge and
+  verification MUST land on a named local branch — never on a detached HEAD.
 
 1. Read the base from `<task-dir>/summary.md` Git State (`Base ref` preferred,
    `Base branch` fallback, `Base SHA`). Verify with:
@@ -80,15 +88,26 @@ to the user. Do not proceed to integration until resolved.
    git merge-base --is-ancestor <Base-SHA> HEAD
    ```
    If Git State is missing or verification fails: STOP and ask the user. Never fall
-   back to guessing `main`/`master`. Checkout and merge target the Base ref
-   (e.g. `upstream/main`), not the short branch name, when they differ.
-2. Detect detached HEAD:
+   back to guessing `main`/`master`.
+2. Resolve the integration branch (refuses detached checkout):
+   ```bash
+   bash <skills-root>/powerflow-finishing/scripts/resolve-integration-branch.sh --task-dir <task-dir> --porcelain
+   ```
+   - Exit 0 → `INTEGRATION_BRANCH=<local branch>`; checkout THAT branch for
+     Options 1/4 below — never `git checkout <Base ref>` when the ref is
+     remote-tracking (that detaches HEAD and the merge lands nowhere).
+   - Exit 3 → Base ref is remote-tracking with no local branch tracking it:
+     STOP and ask the user to create one
+     (`git checkout -b <name> --track <Base ref>`) or pick the integration
+     branch explicitly. Do NOT proceed on detached HEAD.
+   - Exit 1/2 → unknown ref / unreadable summary: STOP and ask the user.
+3. Detect detached HEAD:
    ```bash
    git rev-parse --abbrev-ref HEAD   # prints HEAD when detached
    git symbolic-ref -q HEAD || echo detached
    ```
    On a branch use the Standard menu; when detached use the Detached HEAD menu only.
-3. Determine if the session runs in a Git worktree:
+4. Determine if the session runs in a Git worktree:
    ```bash
    GIT_DIR=$(cd "$(git rev-parse --git-dir)" 2>/dev/null && pwd -P)
    GIT_COMMON=$(cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd -P)
@@ -150,8 +169,12 @@ Which option?
   - If working on a `powerflow/<slug>` branch:
     1. Run the Preflight (Section 4).
     2. Ensure changes are committed.
-    3. Checkout `<Base ref>` (from `summary.md` Git State — never re-derived).
-    4. Pull latest (or record "offline, skipped pull").
+    3. Resolve the integration branch (Section 3, step 2) and checkout THAT
+       local branch — never `git checkout <Base ref>` directly when the ref is
+       remote-tracking. Confirm attached: `git symbolic-ref -q HEAD`.
+    4. Pull latest (or record "offline, skipped pull"). For a branch tracking
+       a non-origin remote, pull from its own upstream (`git pull` follows the
+       tracking config — do not assume `origin`).
     5. Merge: `git merge --ff-only powerflow/<task-slug> || git merge powerflow/<task-slug>`.
        For complex merges, spawn an **Integrator** subagent instead — it executes the
        merge + verification; the orchestrator only coordinates choices. Never run two
@@ -173,7 +196,8 @@ Which option?
     > "This will permanently delete branch <name> and all changes. Type 'discard' to confirm."
   - Once confirmed:
     1. Run the Preflight (Section 4) and save the recovery SHA.
-    2. Checkout the base (`git checkout <Base ref from Git State>`).
+    2. Checkout the integration branch (Section 3, step 2 — a local branch,
+       never a remote-tracking ref).
     3. Delete the feature branch (`git branch -D <feature-branch>`).
     4. Remove the worktree (Section 7) if applicable.
 

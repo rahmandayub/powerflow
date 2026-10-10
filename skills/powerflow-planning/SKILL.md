@@ -64,9 +64,12 @@ If executing discovers the Scope is insufficient: STOP, append a new request blo
 the user's recorded approval, append an Amendment log to `plan-final.md` naming
 the request ID (date + ID + added paths + reason), and re-run the Plan Reviewer
 (abbreviated) before resuming. An approved scope-change does NOT reset the
-3-round review cap. Never expand silently. `validate-transition.sh` only trusts
-the LATEST request block, and only when it is approved + amended + re-reviewed
-ACCEPTED; older approved requests never widen scope.
+3-round review cap. Never expand silently. Effective scope is CUMULATIVE: every
+completed request (approved + amended + re-reviewed ACCEPTED) contributes its
+amended paths to the allowed diff — a newer request never revokes paths
+completed by an older one. The LATEST request must still be complete (or
+rejected) before any transition; a pending/incomplete latest request blocks,
+but the earlier paths stay covered.
 
 Request block format (IDs sequential: SC-001, SC-002, …):
 

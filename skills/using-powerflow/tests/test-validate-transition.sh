@@ -538,8 +538,9 @@ EOF
 assert_exit "validator-scope-complete" 0 "$CODE"
 rm -rf "$REPO"; trap - EXIT
 
-# 23. OLD approved SC-001 does NOT cover the diff when LATEST SC-002 is pending
-#     (only the latest completed request widens scope)
+# 23. Cumulative scope: completed SC-001 still covers its path when LATEST
+#     SC-002 is pending -> transition BLOCKED (scope-change-complete FAIL),
+#     but diff-scope PASSes for the SC-001 path (no revocation).
 read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
 printf 'oops\n' > "$REPO/extra_leak.py"
 git -C "$REPO" add extra_leak.py
@@ -574,7 +575,7 @@ EOF
 OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
 assert_exit "validator-scope-old-approved" 1 "$CODE"
 assert_contains "validator-scope-old-approved-scope" "$OUT" "CHECK scope-change-complete: FAIL"
-assert_contains "validator-scope-old-approved-diff" "$OUT" "CHECK diff-scope: FAIL"
+assert_contains "validator-scope-old-approved-diff" "$OUT" "CHECK diff-scope: PASS"
 rm -rf "$REPO"; trap - EXIT
 
 # 24. Amendment naming the WRONG request ID does not complete SC-002
@@ -773,6 +774,127 @@ EOF
 OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from planning --to executing 2>/dev/null); CODE=$?
 assert_exit "validator-planning-latest-pending" 1 "$CODE"
 assert_contains "validator-planning-latest-pending-check" "$OUT" "CHECK scope-change-pending: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
+# 30. Cumulative: SC-001 approved-complete (helper.php) + SC-002
+#     approved-complete (extra.php), diff touches BOTH -> PASS both checks.
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+printf 'h\n' > "$REPO/helper.php"
+printf 'e\n' > "$REPO/extra.php"
+git -C "$REPO" add helper.php extra.php
+git -C "$REPO" commit -q -m "TASK-003: helpers"
+NEWSHA=$(git -C "$REPO" rev-parse HEAD)
+sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes
+
+## Request SC-001 — 2026-01-01
+Trigger: need helper
+Evidence: src_app.py:1 needs helper.php
+Requested change:
++ helper.php
+AC impact: none
+User decision: approved 2026-01-01 go ahead
+Re-review: implementation-review.md ACCEPTED
+
+## Request SC-002 — 2026-01-02
+Trigger: need extra
+Evidence: src_app.py:2 needs extra.php
+Requested change:
++ extra.php
+AC impact: none
+User decision: approved 2026-01-02 go ahead
+Re-review: implementation-review.md ACCEPTED
+EOF
+cat >> "$TASK/plans/plan-final.md" <<EOF
+
+## Amendment — 2026-01-01 (SC-001)
+Added helper.php (reason: need helper, scope-change SC-001).
+
+## Amendment — 2026-01-02 (SC-002)
+Added extra.php (reason: need extra, scope-change SC-002).
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
+assert_exit "validator-scope-cumul-both" 0 "$CODE"
+assert_contains "validator-scope-cumul-both-diff" "$OUT" "CHECK diff-scope: PASS"
+rm -rf "$REPO"; trap - EXIT
+
+# 31. Cumulative: SC-001 approved-complete (helper.php) + SC-002 REJECTED,
+#     diff touches helper.php only -> PASS (rejected latest revokes nothing).
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+printf 'h\n' > "$REPO/helper.php"
+git -C "$REPO" add helper.php
+git -C "$REPO" commit -q -m "TASK-003: helper"
+NEWSHA=$(git -C "$REPO" rev-parse HEAD)
+sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes
+
+## Request SC-001 — 2026-01-01
+Trigger: need helper
+Evidence: src_app.py:1 needs helper.php
+Requested change:
++ helper.php
+AC impact: none
+User decision: approved 2026-01-01 go ahead
+Re-review: implementation-review.md ACCEPTED
+
+## Request SC-002 — 2026-01-02
+Trigger: dropped idea
+Evidence: src_app.py:2
+Requested change:
++ dropped.php
+AC impact: none
+User decision: rejected
+EOF
+cat >> "$TASK/plans/plan-final.md" <<EOF
+
+## Amendment — 2026-01-01 (SC-001)
+Added helper.php (reason: need helper, scope-change SC-001).
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
+assert_exit "validator-scope-cumul-rejected" 0 "$CODE"
+assert_contains "validator-scope-cumul-rejected-diff" "$OUT" "CHECK diff-scope: PASS"
+rm -rf "$REPO"; trap - EXIT
+
+# 32. Cumulative: SC-001 approved-complete + SC-002 PENDING, diff touches BOTH
+#     paths -> transition BLOCKED, and the SC-002 path still leaks.
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+printf 'h\n' > "$REPO/helper.php"
+printf 'e\n' > "$REPO/extra.php"
+git -C "$REPO" add helper.php extra.php
+git -C "$REPO" commit -q -m "TASK-003: helpers"
+NEWSHA=$(git -C "$REPO" rev-parse HEAD)
+sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes
+
+## Request SC-001 — 2026-01-01
+Trigger: need helper
+Evidence: src_app.py:1 needs helper.php
+Requested change:
++ helper.php
+AC impact: none
+User decision: approved 2026-01-01 go ahead
+Re-review: implementation-review.md ACCEPTED
+
+## Request SC-002 — 2026-01-02
+Trigger: need extra
+Evidence: src_app.py:2 needs extra.php
+Requested change:
++ extra.php
+AC impact: none
+User decision: pending
+EOF
+cat >> "$TASK/plans/plan-final.md" <<EOF
+
+## Amendment — 2026-01-01 (SC-001)
+Added helper.php (reason: need helper, scope-change SC-001).
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
+assert_exit "validator-scope-cumul-pending" 1 "$CODE"
+assert_contains "validator-scope-cumul-pending-scope" "$OUT" "CHECK scope-change-complete: FAIL"
+assert_contains "validator-scope-cumul-pending-diff" "$OUT" "CHECK diff-scope: FAIL"
 rm -rf "$REPO"; trap - EXIT
 
 summary_of
