@@ -48,7 +48,39 @@ skills/
 
 ## Installation
 
-Copy the `skills/` directory (or individual skill folders) into your agent harness's skills directory. For example:
+### Via `skills` CLI (recommended)
+
+Install with the [open agent skills CLI](https://github.com/vercel-labs/skills) — no manual copying needed. It auto-detects your agent (Codex, Claude Code, opencode, Cursor, and 75+ more) and links the skills to the right directory.
+
+```bash
+# Install all 6 skills (non-interactive, all agents)
+npx skills add rahmandayub/powerflow-skills --all
+
+# Or install interactively (pick scope, agents, and skills)
+npx skills add rahmandayub/powerflow-skills
+
+# Install to your user directory so every project can use them
+npx skills add rahmandayub/powerflow-skills --all -g
+```
+
+Useful variants:
+
+```bash
+# Preview available skills without installing
+npx skills add rahmandayub/powerflow-skills --list
+
+# Install specific skills only (always include using-powerflow — it's the entry router)
+npx skills add rahmandayub/powerflow-skills --skill using-powerflow --skill powerflow-planning
+
+# Install to specific agents only
+npx skills add rahmandayub/powerflow-skills --all -a codex -a claude-code -a opencode
+```
+
+Project scope (default) installs to `./<agent>/skills/` so the suite is committed with your project and shared with the team. Global scope (`-g`) installs to `~/<agent>/skills/` for use across all projects.
+
+### Manual install
+
+If your harness isn't supported by the CLI, copy the `skills/` directory (or individual skill folders) into your agent's skills directory:
 
 ```bash
 # Codex / Claude Code style
