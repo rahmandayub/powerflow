@@ -15,7 +15,8 @@ description: Load when an approved plan exists. Implements Small tasks directly 
 ## 1. Branch Isolation
 
 1. Run with porcelain output to capture the Git State:
-   `bash <skills-root>/powerflow-executing/scripts/isolate-branch.sh --task-slug <task-slug> [--base-branch <integration-target>] --porcelain`
+   `TASK_SLUG=$(basename <task-dir>); bash <skills-root>/powerflow-executing/scripts/isolate-branch.sh --task-slug "$TASK_SLUG" [--base-branch <integration-target>] --porcelain`
+   - Derive `--task-slug` from the basename of the resolved `<task-dir>` (the stdout of `init-task-dir.sh`), never the original bare slug — after a `-02` collision fallback this is the only way dir and `powerflow/<slug>` branch stay identical.
    - `--base-branch` names the INTEGRATION target (the branch work merges back
      into, e.g. `main`) and may differ from the current branch. Omit it to
      resolve from the current branch's upstream, else the repo default

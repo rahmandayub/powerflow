@@ -102,6 +102,11 @@ assert_has "doc-summary-base-ref-field" "$USE" '- Base ref:'
 assert_has "doc-summary-base-ref-preferred" "$USE" 'Base ref'
 assert_has "doc-summary-base-ref-ambiguous" "$USE" 'remotes share branch names'
 
+# --- task identity (dir <-> branch sync) -------------------------------------
+
+assert_has "doc-task-identity-canonical" "$USE" 'canonical task identity'
+assert_has "doc-isolate-slug-from-taskdir" "$EXEC" 'basename <task-dir>'
+
 # --- scope-change contract ----------------------------------------------------
 
 assert_has "doc-scope-request-block" "$PLAN" '## Request SC-001'

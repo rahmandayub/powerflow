@@ -35,18 +35,21 @@ mkdir -p "$TMP/.powerflow/2026-01-04-empty"
 assert_exit "init-orphan" 3 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
-# 2b. Same-minute collision on auto-prefixed bare slug resolves to -02 suffix
+# 2b. Same-minute collision on auto-prefixed bare slug resolves to -02/-03 (deterministic clock)
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
-OUT=$(cd "$TMP" && bash "$INIT" --task-slug sameslug 2>/dev/null)
-OUT2=$(cd "$TMP" && bash "$INIT" --task-slug sameslug 2>/dev/null); CODE=$?
+OUT=$(cd "$TMP" && POWERFLOW_NOW=2026-01-08-1200 bash "$INIT" --task-slug sameslug 2>/dev/null); CODE=$?
+assert_exit "init-fixed-create-exit" 0 "$CODE"
+[ "$OUT" = ".powerflow/2026-01-08-1200-sameslug" ] && pass "init-fixed-prefix" || fail "init-fixed-prefix" "got $OUT"
+OUT2=$(cd "$TMP" && POWERFLOW_NOW=2026-01-08-1200 bash "$INIT" --task-slug sameslug 2>/dev/null); CODE=$?
 assert_exit "init-collision-resolved-exit" 0 "$CODE"
-[ "$OUT2" != "$OUT" ] && pass "init-collision-resolved-unique" || fail "init-collision-resolved-unique" "got same dir $OUT2"
-if [ "$(basename "$OUT" | cut -d- -f1-4)" = "$(basename "$OUT2" | cut -d- -f1-4)" ]; then
-  echo "$OUT2" | grep -Eq -- '-02$' && pass "init-collision-resolved-suffix" || fail "init-collision-resolved-suffix" "got $OUT2 (from $OUT)"
-else
-  pass "init-collision-resolved-suffix"
-fi
-[ -d "$TMP/$OUT2/context" ] && pass "init-collision-resolved-subdirs" || fail "init-collision-resolved-subdirs" "missing subdirs in $OUT2"
+[ "$OUT2" = ".powerflow/2026-01-08-1200-sameslug-02" ] && pass "init-collision-resolved-suffix" || fail "init-collision-resolved-suffix" "got $OUT2"
+OUT3=$(cd "$TMP" && POWERFLOW_NOW=2026-01-08-1200 bash "$INIT" --task-slug sameslug 2>/dev/null); CODE=$?
+assert_exit "init-collision-resolved3-exit" 0 "$CODE"
+[ "$OUT3" = ".powerflow/2026-01-08-1200-sameslug-03" ] && pass "init-collision-resolved-suffix3" || fail "init-collision-resolved-suffix3" "got $OUT3"
+[ -d "$TMP/$OUT2/context" ] && [ -d "$TMP/$OUT3/context" ] && pass "init-collision-resolved-subdirs" || fail "init-collision-resolved-subdirs" "missing subdirs in $OUT2/$OUT3"
+# Explicitly dated slug still exits 2 under the same clock (resume preserved).
+(cd "$TMP" && POWERFLOW_NOW=2026-01-08-1200 bash "$INIT" --task-slug 2026-01-08-1200-sameslug >/dev/null 2>&1); CODE=$?
+assert_exit "init-explicit-collision" 2 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
 # 3. Default .gitignore create + append announces

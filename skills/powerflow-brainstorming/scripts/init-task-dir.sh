@@ -4,10 +4,14 @@ set -euo pipefail
 # Creates the Powerflow task directory. Auto-prepends today's date+time
 # (YYYY-MM-DD-HHMM, local time, no colon for filesystem safety) if the slug
 # lacks a date prefix. Legacy YYYY-MM-DD- prefixes are still accepted.
+# POWERFLOW_NOW=YYYY-MM-DD-HHMM overrides the clock (deterministic tests).
 # Exit codes: 0 created | 2 exists with content | 3 exists but empty (orphan)
 # --no-gitignore skips all .gitignore mutation (default appends/creates .powerflow/).
 # Same-minute collision on an auto-prefixed slug resolves to a -02, -03, ...
 # suffix; explicitly dated slugs keep exit 2/3 so resume is never hijacked.
+# Stdout prints the final .powerflow/<resolved-slug> — capture it and derive
+# --task-slug for isolate-branch.sh from its basename so dir and branch stay
+# in sync after a -02 fallback.
 
 TASK_SLUG=""
 NO_GITIGNORE=false
@@ -38,7 +42,8 @@ if [[ "$TASK_SLUG" == -* ]] || [[ "$TASK_SLUG" == .* ]]; then
 fi
 
 if ! [[ "$TASK_SLUG" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}(-[0-9]{4})?-.+ ]]; then
-  TASK_SLUG="$(date +%F-%H%M)-${TASK_SLUG}"
+  NOW="${POWERFLOW_NOW:-$(date +%F-%H%M)}"
+  TASK_SLUG="${NOW}-${TASK_SLUG}"
   echo "Date-time prefix auto-added: $TASK_SLUG" >&2
   AUTO_PREFIXED=true
 else

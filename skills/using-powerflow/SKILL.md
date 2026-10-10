@@ -53,6 +53,7 @@ Cross-skill paths (e.g. `using-powerflow/references/complexity-rubric.md`) resol
 
 5. **Task directory lifecycle**:
    - Create it with `powerflow-brainstorming/scripts/init-task-dir.sh`. Exit 2 (exists with content) or 3 (orphan): ask the user — resume, reuse, or new slug. Never overwrite an existing task dir.
+   - Capture the script's stdout (`.powerflow/<resolved-slug>`); the basename is the canonical task identity. Pass that basename as `--task-slug` to `isolate-branch.sh` so dir and `powerflow/<slug>` branch stay in sync after a `-02` collision fallback.
    - `summary.md` is the state. If it exists, resume from the phase it records — do not reinitialize. There is no `state.json`.
 
 6. **Escalation**: if any review round fails twice in a row with the same blockers OR reaches 3 review rounds without approval, STOP and ask the user, writing the request to `<task-dir>/reports/blocker.md` (template in `powerflow-planning/SKILL.md`).
