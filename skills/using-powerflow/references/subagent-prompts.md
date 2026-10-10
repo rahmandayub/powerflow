@@ -48,13 +48,20 @@ Steps must be bite-sized: one test/check + one minimal change per step. Inspect 
 
 **Role:** Plan Reviewer.
 
-Read `<task-dir>/plans/plan-v1.md` (or vN). Your job is to find defects, not to approve. Check:
-- Classification matches the brief (flag a mismatch).
-- Every file/API referenced actually exists (spot-check with search/read).
-- At least 2 realistic failure scenarios, including one multi-step cascade.
-- Edge cases per step (empty input, boundaries, missing dependencies) have mitigations.
-- Acceptance criteria are testable/verifiable and the step checks cover them.
-- Scope and Out of Scope are unambiguous.
+Read `<task-dir>/context/brief.md` (or, for bug fixes, the most recent Diagnosis Report), `<task-dir>/plans/plan-v1.md` (or vN), and the previous `<task-dir>/reviews/plan-review.md` if one exists. For v2+ or scope-change re-reviews, review only the diff versus the previous round plus unresolved findings — do not re-review approved parts from scratch.
+
+Your job is to find defects in the written plan, not to re-discover the codebase. Focus on logic:
+- Contradictory, duplicated, or out-of-order steps; missing dependencies between TASK-001… steps.
+- Incompleteness: any `AC-00X` without a covering step, any step without an `AC-00X`, missing verification method or command, untestable/unverifiable acceptance criteria.
+- Likely defects: at least 2 realistic failure scenarios, including one multi-step cascade.
+- Edge cases per step (empty input, boundaries, missing dependencies) without mitigations.
+- Ambiguity: Scope / Must Not Change / Out of Scope overlap or are vague; classification mismatches the brief; assumptions lack a way to verify them.
+
+Bounded grounding rule (no massive exploration):
+- ALLOWED: direct verification of paths/APIs explicitly named in the plan only — check that Scope paths exist, `file:line` evidence points to real code, and named symbols exist. Use exact-path read/search.
+- FORBIDDEN: broad/wildcard search for candidate files, tracing entry point → dependencies → consumers, or reading beyond plan-named files to hunt for new issues.
+- Budget: max ~5 targeted reads. Prefer brief citations and plan context over new reads.
+- Unverifiable suspicion → flag as `ASSUMPTION-RISK: <LOW|MEDIUM>` with a reason and stop; do not keep exploring. Only use REVISE/BLOCKED when it creates a concrete logic defect above.
 
 Write `<task-dir>/reviews/plan-review.md` with verdict:
 - `APPROVED` — no findings above LOW.

@@ -41,7 +41,7 @@ Present the plan's scope, files to modify, out-of-scope files, and acceptance cr
 
 ## 4. Plan Review Loop (Big)
 
-Spawn a subagent using the **Plan Reviewer** prompt from [subagent-prompts.md](../using-powerflow/references/subagent-prompts.md). It writes `<task-dir>/reviews/plan-review.md`.
+Spawn a subagent using the **Plan Reviewer** prompt from [subagent-prompts.md](../using-powerflow/references/subagent-prompts.md). It writes `<task-dir>/reviews/plan-review.md`. The reviewer uses bounded grounding (verify only paths/APIs explicitly named in the plan, max ~5 targeted reads, no broad exploration); v2+ rounds review only the diff plus unresolved findings.
 
 - **APPROVED** → proceed to Final Plan Lock.
 - **REVISE AND RESUBMIT** → revise the plan (v2, v3…), re-run the Plan Reviewer.
@@ -63,7 +63,7 @@ If executing discovers the Scope is insufficient: STOP, append a new request blo
 `<task-dir>/reports/scope-change.md` (one block per request, newest last), get
 the user's recorded approval, append an Amendment log to `plan-final.md` naming
 the request ID (date + ID + added paths + reason), and re-run the Plan Reviewer
-(abbreviated) before resuming. An approved scope-change does NOT reset the
+(abbreviated: review only the scope-change request plus affected steps, same bounded grounding rule) before resuming. An approved scope-change does NOT reset the
 3-round review cap. Never expand silently. Effective scope is CUMULATIVE: every
 completed request (approved + amended + re-reviewed ACCEPTED) contributes its
 amended paths to the allowed diff — a newer request never revokes paths
