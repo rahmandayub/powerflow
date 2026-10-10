@@ -612,4 +612,122 @@ assert_exit "validator-scope-two-complete" 0 "$CODE"
 assert_contains "validator-scope-two-complete-diff" "$OUT" "CHECK diff-scope: PASS"
 rm -rf "$REPO"; trap - EXIT
 
+# 26. Partial amendment: SC-003 approves TWO paths, amendment names ID + ONE
+#     path only -> scope-change-complete FAILs; the unamended path still leaks.
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+printf 'approved\n' > "$REPO/approved_helper.py"
+printf 'unreviewed\n' > "$REPO/unreviewed_helper.py"
+git -C "$REPO" add approved_helper.py unreviewed_helper.py
+git -C "$REPO" commit -q -m "TASK-003: helpers"
+NEWSHA=$(git -C "$REPO" rev-parse HEAD)
+sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes — 2026-10-10
+
+## Request SC-003 — 2026-10-10
+Trigger: need helpers
+Evidence: src_app.py:1 needs approved_helper.py and unreviewed_helper.py
+Requested change:
++ approved_helper.py
++ unreviewed_helper.py
+AC impact: none
+User decision: approved 2026-10-10 go ahead
+Re-review: implementation-review.md ACCEPTED
+EOF
+cat >> "$TASK/plans/plan-final.md" <<EOF
+
+## Amendment — 2026-10-10 (SC-003)
+Added approved_helper.py (reason: need helpers, scope-change SC-003).
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>&1); CODE=$?
+assert_exit "validator-scope-partial-amend" 1 "$CODE"
+assert_contains "validator-scope-partial-amend-scope" "$OUT" "CHECK scope-change-complete: FAIL"
+assert_contains "validator-scope-partial-amend-names-path" "$OUT" "unreviewed_helper.py"
+assert_contains "validator-scope-partial-amend-diff" "$OUT" "CHECK diff-scope: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
+# 27. Stale re-review: ACCEPTED then SEND BACK in the same block -> FAIL.
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+printf 'oops\n' > "$REPO/extra_leak.py"
+git -C "$REPO" add extra_leak.py
+git -C "$REPO" commit -q -m "TASK-003: leak"
+NEWSHA=$(git -C "$REPO" rev-parse HEAD)
+sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes — 2026-10-10
+
+## Request SC-004 — 2026-10-10
+Trigger: needed helper
+Evidence: src_app.py:1 needs extra_leak.py
+Requested change:
++ extra_leak.py
+AC impact: none
+User decision: approved 2026-10-10 go ahead
+Re-review: implementation-review.md ACCEPTED
+Re-review: implementation-review.md SEND BACK
+EOF
+cat >> "$TASK/plans/plan-final.md" <<EOF
+
+## Amendment — 2026-10-10 (SC-004)
+Added extra_leak.py (reason: needed helper, scope-change SC-004).
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
+assert_exit "validator-scope-stale-rereview" 1 "$CODE"
+assert_contains "validator-scope-stale-rereview-scope" "$OUT" "CHECK scope-change-complete: FAIL"
+assert_contains "validator-scope-stale-rereview-diff" "$OUT" "CHECK diff-scope: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
+# 28. Planning gate: stale pending in OLD request superseded by newer approved
+#     -> planning->executing PASSES (latest-block rule everywhere).
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes
+
+## Request SC-001 — 2026-01-01
+Trigger: old idea
+Evidence: src_app.py:1
+Requested change:
++ old.py
+AC impact: none
+User decision: pending
+
+## Request SC-002 — 2026-01-02
+Trigger: rejected idea
+Evidence: src_app.py:2
+Requested change:
++ another.py
+AC impact: none
+User decision: rejected
+EOF
+(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from planning --to executing >/dev/null 2>&1); CODE=$?
+assert_exit "validator-planning-stale-pending" 0 "$CODE"
+rm -rf "$REPO"; trap - EXIT
+
+# 29. Planning gate: LATEST request pending -> still FAILs.
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes
+
+## Request SC-001 — 2026-01-01
+Trigger: old idea
+Evidence: src_app.py:1
+Requested change:
++ old.py
+AC impact: none
+User decision: approved 2026-01-01 old
+Re-review: implementation-review.md ACCEPTED
+
+## Request SC-002 — 2026-01-02
+Trigger: new idea
+Evidence: src_app.py:2
+Requested change:
++ another.py
+AC impact: none
+User decision: pending
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from planning --to executing 2>/dev/null); CODE=$?
+assert_exit "validator-planning-latest-pending" 1 "$CODE"
+assert_contains "validator-planning-latest-pending-check" "$OUT" "CHECK scope-change-pending: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
 summary_of

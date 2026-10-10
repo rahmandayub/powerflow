@@ -82,6 +82,16 @@ User decision: pending|approved YYYY-MM-DD <verbatim>|rejected
 Re-review: <review file> <ACCEPTED|SEND BACK>
 ```
 
+Amendment format: one `## Amendment — <date> (<ID>)` section per request, naming
+the ID and EVERY added path (the validator only covers amended paths — an
+amendment naming the ID but omitting a path leaves that path out of scope).
+Only the latest `Re-review:` line in the block counts. Example:
+
+```markdown
+## Amendment — 2026-01-01 (SC-001)
+Added src/extra.py (reason: needed helper, scope-change SC-001).
+```
+
 ## Blocker Report Template (`<task-dir>/reports/blocker.md`)
 
 ```markdown

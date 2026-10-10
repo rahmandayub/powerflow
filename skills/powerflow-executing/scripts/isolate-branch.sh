@@ -64,22 +64,26 @@ fi
 
 # --base-branch names the INTEGRATION target (may differ from current branch).
 # Empty means: resolve from upstream, else repo default, else fail.
-# A self-upstream (branch tracking origin/itself, e.g. feature/foo tracking
-# origin/feature/foo) is NOT an integration target: it is the task branch's
-# own remote, so it is skipped during resolution.
+# Remote identity is preserved end-to-end: BASE_REF keeps the full
+# <remote>/<branch> form when the base comes from an upstream or exists only
+# as a remote-tracking ref, so BASE_SHA is always computed from the exact ref
+# chosen (critical with multiple remotes whose branches share a name).
+# --porcelain still emits the short BASE_BRANCH for summary.md compat.
 if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
   INTEGRATION_BASE="$BASE_BRANCH_OVERRIDE"
+  BASE_REF="$BASE_BRANCH_OVERRIDE"
 else
   INTEGRATION_BASE=""
-  # 1. Upstream of the current branch (e.g. feature/foo tracking origin/main).
+  BASE_REF=""
+  # 1. Upstream of the current branch, kept as full ref (e.g. upstream/main).
   UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
   if [ -n "$UPSTREAM" ]; then
     UPSTREAM_SHORT=$(printf '%s' "$UPSTREAM" | sed -E 's|^[^/]+/||')
     if [ "$UPSTREAM_SHORT" = "$CURRENT" ]; then
-      echo "Note: upstream $UPSTREAM tracks this branch itself — not an integration target; falling back to repo default." >&2
+      echo "Note: upstream $UPSTREAM tracks this branch itself - not an integration target; falling back to repo default." >&2
     else
-      # Strip remote prefix: origin/main -> main.
       INTEGRATION_BASE="$UPSTREAM_SHORT"
+      BASE_REF="$UPSTREAM"
     fi
   fi
   # 2. Repo default: origin/HEAD target, else main/master if present.
@@ -87,10 +91,13 @@ else
     ORIGIN_HEAD=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed -E 's|^origin/||' || true)
     if [ -n "$ORIGIN_HEAD" ]; then
       INTEGRATION_BASE="$ORIGIN_HEAD"
+      BASE_REF="origin/$ORIGIN_HEAD"
     elif git show-ref --verify --quiet refs/heads/main; then
       INTEGRATION_BASE="main"
+      BASE_REF="main"
     elif git show-ref --verify --quiet refs/heads/master; then
       INTEGRATION_BASE="master"
+      BASE_REF="master"
     fi
   fi
   if [ -z "$INTEGRATION_BASE" ]; then
@@ -100,10 +107,17 @@ else
   fi
 fi
 
-# The integration base must exist locally or as a remote-tracking ref.
-if ! git show-ref --verify --quiet "refs/heads/$INTEGRATION_BASE" \
-  && ! git show-ref --verify --quiet "refs/remotes/origin/$INTEGRATION_BASE"; then
-  echo "Error: integration base '$INTEGRATION_BASE' not found (no refs/heads/$INTEGRATION_BASE or refs/remotes/origin/$INTEGRATION_BASE)" >&2
+# The integration base must exist: as the exact ref, locally, or on any remote.
+if git show-ref --verify --quiet "refs/heads/$INTEGRATION_BASE"; then
+  if [ -z "${BASE_REF:-}" ]; then
+    BASE_REF="$INTEGRATION_BASE"
+  fi
+elif [ -n "${BASE_REF:-}" ] && git show-ref --verify --quiet "refs/remotes/$BASE_REF"; then
+  :
+elif git show-ref --verify --quiet "refs/remotes/origin/$INTEGRATION_BASE"; then
+  BASE_REF="origin/$INTEGRATION_BASE"
+else
+  echo "Error: integration base '$INTEGRATION_BASE' not found (no local branch or remote-tracking ref)" >&2
   exit 1
 fi
 
@@ -136,11 +150,7 @@ fi
 # Baseline: merge-base of integration target and HEAD at isolate time.
 # (On a fresh base branch this equals HEAD; on an existing feature branch it
 # is the fork point — never HEAD itself, so the diff-scope check stays sound.)
-BASE_REF="$INTEGRATION_BASE"
-if ! git show-ref --verify --quiet "refs/heads/$INTEGRATION_BASE" \
-  && git show-ref --verify --quiet "refs/remotes/origin/$INTEGRATION_BASE"; then
-  BASE_REF="origin/$INTEGRATION_BASE"
-fi
+# BASE_REF already holds the exact ref resolved above; BASE_SHA comes from it.
 BASE_SHA=$(git merge-base HEAD "$BASE_REF" 2>/dev/null) || {
   echo "Error: no merge base between HEAD and $BASE_REF — wrong integration base?" >&2
   exit 1

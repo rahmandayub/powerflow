@@ -181,8 +181,15 @@ gate_planning_executing() {
   fi
 
   SC="$TASK_DIR/reports/scope-change.md"
-  if [ -f "$SC" ] && grep -Eq 'User decision:[[:space:]]*pending' "$SC"; then
-    check "scope-change-pending" 1 "scope-change.md has User decision: pending — resolve before transitioning"
+  if [ -f "$SC" ]; then
+    # Same latest-block rule as the executing gate: a stale pending line in
+    # an older request must not block once a newer request supersedes it.
+    SC_DECISION=$(scope_change_latest_decision)
+    if [ "$SC_DECISION" = "pending" ]; then
+      check "scope-change-pending" 1 "scope-change.md latest request User decision is pending — resolve before transitioning"
+    else
+      check "scope-change-pending" 0
+    fi
   else
     check "scope-change-pending" 0
   fi
@@ -243,10 +250,31 @@ scope_change_latest_decision() { # prints the LATEST request's "User decision:" 
     | tail -n 1 | grep -Eo '(approved|pending|rejected)\b' -i | tr '[:upper:]' '[:lower:]' || true
 }
 
-scope_change_rereview_accepted() { # 0 if the LATEST request block has "Re-review: ... ACCEPTED"
-  scope_change_latest_block 2>/dev/null \
+scope_change_rereview_accepted() { # 0 if the LATEST "Re-review:" line in the latest block says ACCEPTED
+  # Only the newest verdict counts: an ACCEPTED followed by SEND BACK means
+  # the change is NOT reviewed-accepted.
+  local verdict
+  verdict=$(scope_change_latest_block 2>/dev/null \
     | grep -Ei 're-review[[:space:]]*:' \
-    | grep -Eq '\bACCEPTED\b'
+    | grep -Eo '\b(ACCEPTED|SEND BACK)\b' | tail -n 1 || true)
+  [ "$verdict" = "ACCEPTED" ]
+}
+
+amendment_text() { # prints the Amendment section(s) for the request: from an Amendment heading naming the ID to the next heading (or EOF); all Amendment sections if legacy
+  local req_id="$1"
+  local plan="$TASK_DIR/plans/plan-final.md"
+  [ -f "$plan" ] || return 0
+  if [ -n "$req_id" ]; then
+    awk -v id="$req_id" '
+      /^#/ { if (in_sec) exit; if (tolower($0) ~ /amendment/ && index($0, id)) in_sec = 1; next }
+      in_sec { print }
+    ' "$plan" || true
+  else
+    awk '
+      /^#/ { if (tolower($0) ~ /amendment/) in_sec = 1; else in_sec = 0; next }
+      in_sec { print }
+    ' "$plan" || true
+  fi
 }
 
 plan_amendment_names() { # 0 if plan-final.md amends the given request: names its ID, or (legacy) its paths
@@ -268,12 +296,28 @@ plan_amendment_names() { # 0 if plan-final.md amends the given request: names it
   return 1
 }
 
-approved_extra_paths() { # prints '+' (addition) paths from the LATEST completed request
+# Prints the subset of req_paths actually named in the amendment text.
+# For ID requests: amendment must name the ID AND each covered path.
+# For legacy: amendment must name each covered path.
+amended_paths_only() { # amended_paths_only <req_id> <req_paths...> -> covered paths, one per line
+  local req_id="$1"; shift
+  local text p
+  text=$(amendment_text "$req_id")
+  [ -n "$text" ] || return 0
+  for p in "$@"; do
+    if printf '%s\n' "$text" | grep -Eq "(^|[^A-Za-z0-9_./-])$(printf '%s' "$p" | sed 's/\./\\./g')([^A-Za-z0-9_./-]|$)"; then
+      printf '%s\n' "$p"
+    fi
+  done
+}
+
+approved_extra_paths() { # prints the LATEST request's '+' paths covered by its amendment
   # Protocol completion requires ALL of, within the LATEST "## Request" block:
-  # decision approved, a "Re-review: ... ACCEPTED" line, and an Amendment
-  # section in plan-final.md naming the request ID (or the paths, for legacy
-  # files without Request IDs). Only '+' bullets are additions; '-' bullets
-  # are removals and never widen the allowed diff.
+  # decision approved, the LATEST "Re-review:" line saying ACCEPTED, and an
+  # Amendment section in plan-final.md naming the request ID (or the paths,
+  # for legacy files without Request IDs). Only amended '+' paths are
+  # returned: an amendment naming the ID but omitting a path does NOT cover
+  # that path. '-' bullets are removals and never widen the allowed diff.
   local sc="$TASK_DIR/reports/scope-change.md"
   [ -f "$sc" ] || return 0
   [ "$(scope_change_latest_decision)" = "approved" ] || return 0
@@ -286,7 +330,8 @@ approved_extra_paths() { # prints '+' (addition) paths from the LATEST completed
     | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true)
   [ -n "$req_paths" ] || return 0
   plan_amendment_names "$req_id" "$req_paths" || return 0
-  printf '%s\n' "$req_paths"
+  # shellcheck disable=SC2086
+  amended_paths_only "$req_id" $req_paths
 }
 
 plan_scope_paths() { # prints scope bullet paths from plan-final.md
@@ -347,16 +392,23 @@ gate_executing_finishing() {
     elif [ "$LATEST_DECISION" = "rejected" ]; then
       check "scope-change-complete" 0
     elif [ "$LATEST_DECISION" = "approved" ]; then
+      LATEST_PATHS=$(scope_change_latest_block | awk '/Requested change/{flag=1; next} /AC impact/{flag=0} flag' | grep -Eo '^[[:space:]]*\+[[:space:]]+[A-Za-z0-9_./-]+' | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true)
       if ! scope_change_rereview_accepted; then
-        check "scope-change-complete" 1 "scope-change $LATEST_WHAT approved but its block has no Re-review ACCEPTED line — re-run the reviewer before transitioning"
-      elif ! plan_amendment_names "$LATEST_ID" "$(scope_change_latest_block | awk '/Requested change/{flag=1; next} /AC impact/{flag=0} flag' | grep -Eo '^[[:space:]]*\+[[:space:]]+[A-Za-z0-9_./-]+' | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true)"; then
+        check "scope-change-complete" 1 "scope-change $LATEST_WHAT approved but its latest Re-review verdict is not ACCEPTED — re-run the reviewer before transitioning"
+      elif ! plan_amendment_names "$LATEST_ID" "$LATEST_PATHS"; then
         if [ -n "$LATEST_ID" ]; then
           check "scope-change-complete" 1 "scope-change $LATEST_WHAT approved but plan-final.md has no Amendment naming $LATEST_ID — amend the plan before transitioning"
         else
           check "scope-change-complete" 1 "scope-change approved but plan-final.md has no Amendment naming its paths — amend the plan before transitioning"
         fi
       else
-        check "scope-change-complete" 0
+        # shellcheck disable=SC2086
+        UNAMENDED=$(comm -23 <(printf '%s\n' $LATEST_PATHS | sort -u) <(amended_paths_only "$LATEST_ID" $LATEST_PATHS | sort -u) || true)
+        if [ -n "$UNAMENDED" ]; then
+          check "scope-change-complete" 1 "scope-change $LATEST_WHAT amendment omits approved paths:$(printf ' %s' $UNAMENDED) — amend every path before transitioning"
+        else
+          check "scope-change-complete" 0
+        fi
       fi
     else
       check "scope-change-complete" 1 "scope-change.md $LATEST_WHAT has no parseable User decision (pending|approved|rejected) — resolve before transitioning"

@@ -84,8 +84,6 @@ assert_contains "isolate-self-base-base" "$OUT" "^BASE_BRANCH=my-feature$"
 rm -rf "$TMP"; trap - EXIT
 
 # 2g. Reused branch whose resolved base EQUALS itself -> exit 1 (self-merge guard).
-#     Simulate: feature/solo tracking origin/main, but origin/main deleted and
-#     repo default absent — craft via explicit override of a same-named ref?
 #     Simplest deterministic case: branch 'solo' with upstream origin/solo and
 #     no main/master/origin/HEAD left.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
@@ -95,6 +93,26 @@ git -C "$TMP" branch --set-upstream-to=refs/remotes/origin/solo 2>/dev/null
 git -C "$TMP" branch -D main
 (cd "$TMP" && bash "$ISOLATE" --task-slug feat2g >/dev/null 2>&1); CODE=$?
 assert_exit "isolate-self-merge-guard" 1 "$CODE"
+rm -rf "$TMP"; trap - EXIT
+
+# 2h. Multi-remote: origin/main and upstream/main diverge; branch tracking
+#     upstream/main resolves BASE to upstream's main (fork point), not local's.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" checkout -qb work
+git -C "$TMP" update-ref refs/remotes/origin/main refs/heads/main
+# upstream/main points at a different commit than origin/main:
+git -C "$TMP" commit -q --allow-empty -m "upstream-only"
+git -C "$TMP" update-ref refs/remotes/upstream/main HEAD
+git -C "$TMP" reset -q --hard refs/remotes/origin/main
+git -C "$TMP" branch --set-upstream-to=refs/remotes/upstream/main 2>/dev/null
+UPSTREAM_MAIN_SHA=$(git -C "$TMP" rev-parse refs/remotes/upstream/main)
+OUT=$(cd "$TMP" && bash "$ISOLATE" --task-slug feat2h --porcelain 2>/dev/null); CODE=$?
+assert_exit "isolate-multiremote-exit" 0 "$CODE"
+assert_contains "isolate-multiremote-base" "$OUT" "^BASE_BRANCH=main$"
+PORC_SHA=$(printf '%s' "$OUT" | grep '^BASE_SHA=' | cut -d= -f2)
+FORK=$(git -C "$TMP" merge-base HEAD refs/remotes/upstream/main)
+[ "$PORC_SHA" = "$FORK" ] && pass "isolate-multiremote-sha" || fail "isolate-multiremote-sha" "BASE_SHA=$PORC_SHA expected fork $FORK with upstream/main"
+[ "$PORC_SHA" != "$UPSTREAM_MAIN_SHA" ] && pass "isolate-multiremote-not-upstream-head" || fail "isolate-multiremote-not-upstream-head" "BASE_SHA must be the fork point, not upstream/main HEAD"
 rm -rf "$TMP"; trap - EXIT
 
 # 3a. --base-branch match -> ok; 3b. unknown base -> exit 1
