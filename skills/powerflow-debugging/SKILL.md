@@ -7,7 +7,7 @@ description: Load for bug fixes, failing tests, and crashes — as an entry poin
 
 ## Before You Start
 
-- Task directory: `.powerflow/YYYY-MM-DD-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (add `--no-gitignore` to skip `.gitignore` mutation; exit 2/3 → ask the user). Announce explicitly if `.gitignore` was created or modified.
+- Task directory: `.powerflow/YYYY-MM-DD-HHMM-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (add `--no-gitignore` to skip `.gitignore` mutation; exit 2/3 → ask the user). Announce explicitly if `.gitignore` was created or modified.
 - Read `<task-dir>/summary.md` first if it exists.
 - Announce: `"I'm using the powerflow-debugging skill to analyze this failure."`
 

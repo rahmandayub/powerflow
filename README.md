@@ -92,7 +92,7 @@ cp -r skills/* ~/.agents/skills/
 - **Phase gating** — every phase requires a concrete artifact (`brief.md`, `plan-final.md`, verified changes) before the next phase starts.
 - **Small/Big classification** — Small tasks are handled directly by the orchestrator; Big tasks are delegated to subagents for discovery, planning, implementation, and review.
 - **Evidence rule** — every claim is labeled `FACT` (with `file:line`) or `ASSUMPTION`; bare claims are rewritten.
-- **Task directory protocol** — state lives in `.powerflow/YYYY-MM-DD-<task-slug>/`; `summary.md` is the single source of truth, written at the end of each phase and read at the start of the next.
+- **Task directory protocol** — state lives in `.powerflow/YYYY-MM-DD-HHMM-<task-slug>/`; `summary.md` is the single source of truth, written at the end of each phase and read at the start of the next.
 - **Subagent registry** — all prompts are self-contained and inline in `using-powerflow/references/subagent-prompts.md`.
 
 ## License

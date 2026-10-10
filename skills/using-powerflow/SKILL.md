@@ -7,7 +7,7 @@ description: Entry router for the Powerflow skill suite. Establishes the phase w
 
 ## Before You Start
 
-- Task directory: `.powerflow/YYYY-MM-DD-<task-slug>/` in the project root (e.g. `.powerflow/2026-07-05-auth-bug`).
+- Task directory: `.powerflow/YYYY-MM-DD-HHMM-<task-slug>/` in the project root (e.g. `.powerflow/2026-07-05-1430-auth-bug`; legacy `YYYY-MM-DD-<slug>` still accepted).
 - If `<task-dir>/summary.md` exists, read it FIRST. It records the current phase, outputs so far, and user decisions — it is the only state the suite keeps.
 - Announce: `"Using powerflow to <purpose>."`
 

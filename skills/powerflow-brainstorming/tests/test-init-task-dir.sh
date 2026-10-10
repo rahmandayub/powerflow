@@ -7,18 +7,21 @@ SKILLS_ROOT=$(cd "$HERE/../.." && pwd)
 source "$SKILLS_ROOT/using-powerflow/tests/helpers.sh"
 INIT="$SKILLS_ROOT/powerflow-brainstorming/scripts/init-task-dir.sh"
 
-# 1. Bare slug gets date prefix; dated slug preserved; subdirs exist
+# 1. Bare slug gets date-time prefix; legacy dated + new datetime slugs preserved; subdirs exist
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 OUT=$(cd "$TMP" && bash "$INIT" --task-slug myslug 2>/dev/null); CODE=$?
 assert_exit "init-create-exit" 0 "$CODE"
 DIRNAME=$(basename "$OUT")
-printf '%s' "$DIRNAME" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}-myslug$' && pass "init-date-prefix" || fail "init-date-prefix" "got $DIRNAME"
+printf '%s' "$DIRNAME" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}-myslug$' && pass "init-date-prefix" || fail "init-date-prefix" "got $DIRNAME"
 for d in context plans reviews executions/diagnostics reports; do
   [ -d "$TMP/$OUT/$d" ] && pass "init-subdir-$d" || fail "init-subdir-$d" "missing $OUT/$d"
 done
 OUT2=$(cd "$TMP" && bash "$INIT" --task-slug 2026-01-02-fixed 2>/dev/null); CODE=$?
 assert_exit "init-dated-exit" 0 "$CODE"
 [ "$OUT2" = ".powerflow/2026-01-02-fixed" ] && pass "init-dated-preserved" || fail "init-dated-preserved" "got $OUT2"
+OUT3=$(cd "$TMP" && bash "$INIT" --task-slug 2026-01-02-1430-fixed2 2>/dev/null); CODE=$?
+assert_exit "init-datetime-exit" 0 "$CODE"
+[ "$OUT3" = ".powerflow/2026-01-02-1430-fixed2" ] && pass "init-datetime-preserved" || fail "init-datetime-preserved" "got $OUT3"
 rm -rf "$TMP"; trap - EXIT
 
 # 2. Collision with content -> exit 2; empty orphan -> exit 3
@@ -30,6 +33,20 @@ assert_exit "init-collision" 2 "$CODE"
 mkdir -p "$TMP/.powerflow/2026-01-04-empty"
 (cd "$TMP" && bash "$INIT" --task-slug 2026-01-04-empty >/dev/null 2>&1); CODE=$?
 assert_exit "init-orphan" 3 "$CODE"
+rm -rf "$TMP"; trap - EXIT
+
+# 2b. Same-minute collision on auto-prefixed bare slug resolves to -02 suffix
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$INIT" --task-slug sameslug 2>/dev/null)
+OUT2=$(cd "$TMP" && bash "$INIT" --task-slug sameslug 2>/dev/null); CODE=$?
+assert_exit "init-collision-resolved-exit" 0 "$CODE"
+[ "$OUT2" != "$OUT" ] && pass "init-collision-resolved-unique" || fail "init-collision-resolved-unique" "got same dir $OUT2"
+if [ "$(basename "$OUT" | cut -d- -f1-4)" = "$(basename "$OUT2" | cut -d- -f1-4)" ]; then
+  echo "$OUT2" | grep -Eq -- '-02$' && pass "init-collision-resolved-suffix" || fail "init-collision-resolved-suffix" "got $OUT2 (from $OUT)"
+else
+  pass "init-collision-resolved-suffix"
+fi
+[ -d "$TMP/$OUT2/context" ] && pass "init-collision-resolved-subdirs" || fail "init-collision-resolved-subdirs" "missing subdirs in $OUT2"
 rm -rf "$TMP"; trap - EXIT
 
 # 3. Default .gitignore create + append announces

@@ -1,6 +1,6 @@
 # Subagent Prompts
 
-Self-contained prompts. Each prompt includes everything the subagent needs — no other file to read. Substitute `<task-dir>` with the real path (`.powerflow/YYYY-MM-DD-<slug>/`) when invoking.
+Self-contained prompts. Each prompt includes everything the subagent needs — no other file to read. Substitute `<task-dir>` with the real path (`.powerflow/YYYY-MM-DD-HHMM-<slug>/`) when invoking.
 
 ## Discovery (Brainstorming, Big)
 

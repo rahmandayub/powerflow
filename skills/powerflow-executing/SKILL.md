@@ -7,7 +7,7 @@ description: Load when an approved plan exists. Implements Small tasks directly 
 
 ## Before You Start
 
-- Task directory: `.powerflow/YYYY-MM-DD-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (add `--no-gitignore` to skip `.gitignore` mutation; exit 2/3 → ask the user). Announce explicitly if `.gitignore` was created or modified.
+- Task directory: `.powerflow/YYYY-MM-DD-HHMM-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (add `--no-gitignore` to skip `.gitignore` mutation; exit 2/3 → ask the user). Announce explicitly if `.gitignore` was created or modified.
 - Read `<task-dir>/summary.md` first if it exists, then the approved Final Plan at `<task-dir>/plans/plan-final.md`.
 - Extract the **Implementation Contract** — it is the highest authority; do not violate it.
 - Announce: `"I'm using the powerflow-executing skill to implement the approved plan."`

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Creates the Powerflow task directory. Auto-prepends today's date if the slug
-# lacks a YYYY-MM-DD- prefix.
+# Creates the Powerflow task directory. Auto-prepends today's date+time
+# (YYYY-MM-DD-HHMM, local time, no colon for filesystem safety) if the slug
+# lacks a date prefix. Legacy YYYY-MM-DD- prefixes are still accepted.
 # Exit codes: 0 created | 2 exists with content | 3 exists but empty (orphan)
 # --no-gitignore skips all .gitignore mutation (default appends/creates .powerflow/).
+# Same-minute collision on an auto-prefixed slug resolves to a -02, -03, ...
+# suffix; explicitly dated slugs keep exit 2/3 so resume is never hijacked.
 
 TASK_SLUG=""
 NO_GITIGNORE=false
@@ -34,17 +37,42 @@ if [[ "$TASK_SLUG" == -* ]] || [[ "$TASK_SLUG" == .* ]]; then
   exit 1
 fi
 
-if ! [[ "$TASK_SLUG" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-.+ ]]; then
-  TASK_SLUG="$(date +%F)-${TASK_SLUG}"
-  echo "Date prefix auto-added: $TASK_SLUG" >&2
+if ! [[ "$TASK_SLUG" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}(-[0-9]{4})?-.+ ]]; then
+  TASK_SLUG="$(date +%F-%H%M)-${TASK_SLUG}"
+  echo "Date-time prefix auto-added: $TASK_SLUG" >&2
+  AUTO_PREFIXED=true
+else
+  AUTO_PREFIXED=false
 fi
 
 TASK_DIR=".powerflow/$TASK_SLUG"
 
 if [ -d "$TASK_DIR" ]; then
   if [ -n "$(ls -A "$TASK_DIR")" ]; then
-    echo "[COLLISION] $TASK_DIR exists with content. Resume it or pick a new slug." >&2
-    exit 2
+    # Same-minute collision on a just-auto-prefixed slug: find a free
+    # -02/-03/... suffix instead of forcing the agent to ask the user.
+    # Explicitly dated slugs still exit 2 so resume intent is preserved.
+    if [ "${AUTO_PREFIXED:-false}" = true ]; then
+      RESOLVED=""
+      for i in $(seq 2 99); do
+        CAND="${TASK_SLUG}-$(printf '%02d' "$i")"
+        if [ ! -e ".powerflow/$CAND" ]; then
+          RESOLVED="$CAND"
+          break
+        fi
+      done
+      if [ -n "$RESOLVED" ]; then
+        echo "[COLLISION-RESOLVED] $TASK_DIR exists; using .powerflow/$RESOLVED instead." >&2
+        TASK_SLUG="$RESOLVED"
+        TASK_DIR=".powerflow/$TASK_SLUG"
+      else
+        echo "[COLLISION] $TASK_DIR exists with content. Resume it or pick a new slug." >&2
+        exit 2
+      fi
+    else
+      echo "[COLLISION] $TASK_DIR exists with content. Resume it or pick a new slug." >&2
+      exit 2
+    fi
   else
     echo "[ORPHAN] $TASK_DIR exists but is empty. Reuse it or pick a new slug." >&2
     exit 3
