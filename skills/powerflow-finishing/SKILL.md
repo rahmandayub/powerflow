@@ -50,10 +50,13 @@ Run tiers in order on the current branch; STOP on the first red tier:
 
 Policy: always run Tier 1+2; Tier 3 is required before Option 1 (merge) or Option 2
 (PR). A Small task may record a user waiver for Tier 3 in
-`<task-dir>/reports/tier3-waiver.md` (user decision verbatim + date + reason) —
-never skip Tier 1+2, and Big tasks cannot waive Tier 3. The `--preflight` mode
-of `validate-transition.sh` enforces exactly this (Tier 1+2 PASS at HEAD, plus
-Tier 3 PASS at HEAD or a valid waiver).
+`<task-dir>/reports/tier3-waiver.md` — it must hold a `User decision:` line with
+a YYYY-MM-DD date, a waiver verb, a Tier 3 reference, and a parenthesized reason
+(e.g. `User decision: 2026-01-01 waive Tier 3 full suite (reason: trivial
+one-file change, Tier 1+2 green).`) — never skip Tier 1+2, and Big tasks cannot
+waive Tier 3. The `--preflight` mode of `validate-transition.sh` enforces exactly
+this (Tier 1+2 PASS at HEAD, plus Tier 3 PASS at HEAD or a valid waiver), and
+also verifies the current checkout is the recorded Task branch.
 
 Log every tier to `<task-dir>/executions/pre-integration-test-run.log` with a
 validator-parseable header per tier:

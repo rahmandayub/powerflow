@@ -59,12 +59,28 @@ Spawn a subagent using the **Plan Reviewer** prompt from [subagent-prompts.md](.
 
 ## Scope Changes After Lock
 
-If executing discovers the Scope is insufficient: STOP, write
-`<task-dir>/reports/scope-change.md` (Trigger / Evidence `file:line` / Requested change
-/ AC impact / User decision: pending|approved YYYY-MM-DD verbatim|rejected / Re-review),
-get the user's recorded approval, append an Amendment log to `plan-final.md` (date +
-added paths + reason), and re-run the Plan Reviewer (abbreviated) before resuming.
-An approved scope-change does NOT reset the 3-round review cap. Never expand silently.
+If executing discovers the Scope is insufficient: STOP, append a new request block to
+`<task-dir>/reports/scope-change.md` (one block per request, newest last), get
+the user's recorded approval, append an Amendment log to `plan-final.md` naming
+the request ID (date + ID + added paths + reason), and re-run the Plan Reviewer
+(abbreviated) before resuming. An approved scope-change does NOT reset the
+3-round review cap. Never expand silently. `validate-transition.sh` only trusts
+the LATEST request block, and only when it is approved + amended + re-reviewed
+ACCEPTED; older approved requests never widen scope.
+
+Request block format (IDs sequential: SC-001, SC-002, …):
+
+```markdown
+## Request SC-001 — 2026-01-01
+Trigger: <why the scope is insufficient>
+Evidence: <file:line showing the need>
+Requested change:
++ <added path>
+- <removed path, if any>
+AC impact: <which AC-00X affected, or none>
+User decision: pending|approved YYYY-MM-DD <verbatim>|rejected
+Re-review: <review file> <ACCEPTED|SEND BACK>
+```
 
 ## Blocker Report Template (`<task-dir>/reports/blocker.md`)
 

@@ -59,6 +59,44 @@ TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 assert_exit "isolate-unknown-base" 1 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
+# 2e. Self-upstream (feature tracking origin/itself) is NOT an integration
+#     target: falls back to repo default (main), task branch stays the feature.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" checkout -qb feature/example
+git -C "$TMP" update-ref refs/remotes/origin/feature/example refs/heads/feature/example
+git -C "$TMP" branch --set-upstream-to=refs/remotes/origin/feature/example 2>/dev/null
+OUT=$(cd "$TMP" && bash "$ISOLATE" --task-slug feat2e --porcelain 2>/dev/null); CODE=$?
+assert_exit "isolate-self-upstream-exit" 0 "$CODE"
+assert_contains "isolate-self-upstream-base" "$OUT" "^BASE_BRANCH=main$"
+assert_contains "isolate-self-upstream-task" "$OUT" "^TASK_BRANCH=feature/example$"
+assert_contains "isolate-self-upstream-action" "$OUT" "^ACTION=reused$"
+assert_not_contains "isolate-self-upstream-noconflate" "$OUT" "^BASE_BRANCH=feature/example$"
+rm -rf "$TMP"; trap - EXIT
+
+# 2f. Explicit --base-branch equal to current branch ISOLATES (no self-merge:
+#     task branch becomes powerflow/<slug>, base stays the named branch).
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" checkout -qb my-feature
+OUT=$(cd "$TMP" && bash "$ISOLATE" --task-slug feat2f --base-branch my-feature --porcelain 2>/dev/null); CODE=$?
+assert_exit "isolate-self-base" 0 "$CODE"
+assert_contains "isolate-self-base-task" "$OUT" "^TASK_BRANCH=powerflow/feat2f$"
+assert_contains "isolate-self-base-base" "$OUT" "^BASE_BRANCH=my-feature$"
+rm -rf "$TMP"; trap - EXIT
+
+# 2g. Reused branch whose resolved base EQUALS itself -> exit 1 (self-merge guard).
+#     Simulate: feature/solo tracking origin/main, but origin/main deleted and
+#     repo default absent — craft via explicit override of a same-named ref?
+#     Simplest deterministic case: branch 'solo' with upstream origin/solo and
+#     no main/master/origin/HEAD left.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" checkout -qb solo
+git -C "$TMP" update-ref refs/remotes/origin/solo refs/heads/solo
+git -C "$TMP" branch --set-upstream-to=refs/remotes/origin/solo 2>/dev/null
+git -C "$TMP" branch -D main
+(cd "$TMP" && bash "$ISOLATE" --task-slug feat2g >/dev/null 2>&1); CODE=$?
+assert_exit "isolate-self-merge-guard" 1 "$CODE"
+rm -rf "$TMP"; trap - EXIT
+
 # 3a. --base-branch match -> ok; 3b. unknown base -> exit 1
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 (cd "$TMP" && bash "$ISOLATE" --task-slug f3 --base-branch main >/dev/null 2>&1); CODE=$?

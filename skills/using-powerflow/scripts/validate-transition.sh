@@ -20,10 +20,13 @@ set -euo pipefail
 # "Classification: Small|Big" line (mid-flight escalation), else from
 # context/brief.md ([OVERRIDE BY USER] honored).
 #
-# Scope-change protocol: only the LATEST "User decision:" line counts. An
-# approved change covers out-of-scope diffs only with '+' (addition) paths,
-# an Amendment section in plan-final.md naming those paths, and a
-# "Re-review: ... ACCEPTED" line. Only AC lines with PASS count as evidence.
+# Scope-change protocol: the file holds one block per request, each headed by
+# "## Request <ID>" (e.g. "## Request SC-001 — 2026-01-01"). Only the LATEST
+# request block counts. An approved request covers out-of-scope diffs only
+# with its own '+' (addition) paths, an Amendment section in plan-final.md
+# naming that request ID and its paths, and a "Re-review: ... ACCEPTED" line
+# inside the same request block. Older approved requests never widen scope
+# for newer diffs. Only AC lines with PASS count as evidence.
 #
 # Exit codes: 0 all checks pass | 1 gate FAIL | 2 usage, missing task dir,
 #   not a git repo, or unreadable summary.md
@@ -212,33 +215,78 @@ ledger_has_ac() { # ledger_has_ac <AC-ID> -> 0 if id appears with PASS + evidenc
   return 1
 }
 
-scope_change_latest_decision() { # prints the LATEST "User decision:" value, lowercased
-  grep -Ei 'user decision[[:space:]]*:' "$TASK_DIR/reports/scope-change.md" 2>/dev/null \
+scope_change_latest_block() { # prints the LATEST "## Request ..." block of scope-change.md
+  # Request blocks start at a "## Request <id>" heading and run to the next
+  # "## Request " heading or EOF. Files without any such heading are legacy:
+  # the whole file is treated as one block.
+  local sc="$TASK_DIR/reports/scope-change.md"
+  [ -f "$sc" ] || return 1
+  if ! grep -Eq '^## Request ' "$sc"; then
+    cat "$sc"
+    return 0
+  fi
+  awk '
+    /^## Request / { if (buf != "") last = buf; buf = ""; in_req = 1; }
+    in_req { buf = buf $0 "\n"; }
+    END { if (buf != "") last = buf; printf "%s", last; }
+  ' "$sc"
+}
+
+scope_change_latest_id() { # prints the latest request ID (e.g. SC-001), or empty for legacy files
+  grep -E '^## Request ' "$TASK_DIR/reports/scope-change.md" 2>/dev/null \
+    | tail -n 1 | grep -Eo 'SC-[0-9]+' | head -n 1 || true
+}
+
+scope_change_latest_decision() { # prints the LATEST request's "User decision:" value, lowercased
+  scope_change_latest_block 2>/dev/null \
+    | grep -Ei 'user decision[[:space:]]*:' \
     | tail -n 1 | grep -Eo '(approved|pending|rejected)\b' -i | tr '[:upper:]' '[:lower:]' || true
 }
 
-scope_change_rereview_accepted() { # 0 if a "Re-review: ... ACCEPTED" line exists
-  grep -Ei 're-review[[:space:]]*:' "$TASK_DIR/reports/scope-change.md" 2>/dev/null \
+scope_change_rereview_accepted() { # 0 if the LATEST request block has "Re-review: ... ACCEPTED"
+  scope_change_latest_block 2>/dev/null \
+    | grep -Ei 're-review[[:space:]]*:' \
     | grep -Eq '\bACCEPTED\b'
 }
 
-plan_has_scope_amendment() { # 0 if plan-final.md has an Amendment section
-  grep -Ei 'amendment' "$TASK_DIR/plans/plan-final.md" 2>/dev/null | grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}|added|scope-change'
+plan_amendment_names() { # 0 if plan-final.md amends the given request: names its ID, or (legacy) its paths
+  local req_id="$1" req_paths="$2"
+  local plan="$TASK_DIR/plans/plan-final.md"
+  grep -Eqi 'amendment' "$plan" 2>/dev/null || return 1
+  if [ -n "$req_id" ]; then
+    grep -Ei 'amendment' "$plan" 2>/dev/null | grep -Eq "$req_id" && return 0
+    return 1
+  fi
+  # Legacy files have no Request ID: the amendment must name at least one of
+  # the request's '+' paths.
+  local p
+  for p in $req_paths; do
+    if grep -Ei 'amendment' "$plan" 2>/dev/null | grep -Eq "(^|[^A-Za-z0-9_./-])$(printf '%s' "$p" | sed 's/\./\\./g')([^A-Za-z0-9_./-]|$)"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
-approved_extra_paths() { # prints '+' (addition) paths from a COMPLETED scope-change
-  # Protocol completion requires ALL of: latest decision is approved, an
-  # Amendment section in plan-final.md naming the paths, and a
-  # "Re-review: ... ACCEPTED" line. Only '+' bullets are additions; '-'
-  # bullets are removals and never widen the allowed diff.
+approved_extra_paths() { # prints '+' (addition) paths from the LATEST completed request
+  # Protocol completion requires ALL of, within the LATEST "## Request" block:
+  # decision approved, a "Re-review: ... ACCEPTED" line, and an Amendment
+  # section in plan-final.md naming the request ID (or the paths, for legacy
+  # files without Request IDs). Only '+' bullets are additions; '-' bullets
+  # are removals and never widen the allowed diff.
   local sc="$TASK_DIR/reports/scope-change.md"
   [ -f "$sc" ] || return 0
   [ "$(scope_change_latest_decision)" = "approved" ] || return 0
   scope_change_rereview_accepted || return 0
-  plan_has_scope_amendment || return 0
-  awk '/Requested change/{flag=1; next} /AC impact/{flag=0} flag' "$sc" \
+  local req_id req_paths
+  req_id=$(scope_change_latest_id)
+  req_paths=$(scope_change_latest_block \
+    | awk '/Requested change/{flag=1; next} /AC impact/{flag=0} flag' \
     | grep -Eo '^[[:space:]]*\+[[:space:]]+[A-Za-z0-9_./-]+' \
-    | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true
+    | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true)
+  [ -n "$req_paths" ] || return 0
+  plan_amendment_names "$req_id" "$req_paths" || return 0
+  printf '%s\n' "$req_paths"
 }
 
 plan_scope_paths() { # prints scope bullet paths from plan-final.md
@@ -280,26 +328,38 @@ gate_executing_finishing() {
     check "ac-evidence" 1 "AC ids without PASS + evidence in verification-ledger.md (or scope-check.txt):$MISSING_AC"
   fi
 
-  # Scope-change protocol completion: a scope-change.md with a non-final
-  # decision blocks; an approved-but-incomplete protocol (no amendment or no
-  # ACCEPTED re-review) also blocks, so '+' paths are never trusted early.
+  # Scope-change protocol completion, per LATEST "## Request" block: a pending
+  # or undecided latest request blocks; an approved-but-incomplete request
+  # (no ACCEPTED re-review in its block, or no Amendment naming its ID/paths)
+  # also blocks, so '+' paths are never trusted early. Older approved
+  # requests never widen scope — only the latest completed one does.
   SC_FILE="$TASK_DIR/reports/scope-change.md"
   if [ -f "$SC_FILE" ]; then
     LATEST_DECISION=$(scope_change_latest_decision)
+    LATEST_ID=$(scope_change_latest_id)
+    if [ -n "$LATEST_ID" ]; then
+      LATEST_WHAT="request $LATEST_ID"
+    else
+      LATEST_WHAT="latest request"
+    fi
     if [ "$LATEST_DECISION" = "pending" ]; then
-      check "scope-change-complete" 1 "scope-change.md latest User decision is pending — resolve before transitioning"
+      check "scope-change-complete" 1 "scope-change.md $LATEST_WHAT User decision is pending — resolve before transitioning"
     elif [ "$LATEST_DECISION" = "rejected" ]; then
       check "scope-change-complete" 0
     elif [ "$LATEST_DECISION" = "approved" ]; then
       if ! scope_change_rereview_accepted; then
-        check "scope-change-complete" 1 "scope-change approved but no Re-review ACCEPTED line — re-run the reviewer before transitioning"
-      elif ! plan_has_scope_amendment; then
-        check "scope-change-complete" 1 "scope-change approved but plan-final.md has no Amendment section — amend the plan before transitioning"
+        check "scope-change-complete" 1 "scope-change $LATEST_WHAT approved but its block has no Re-review ACCEPTED line — re-run the reviewer before transitioning"
+      elif ! plan_amendment_names "$LATEST_ID" "$(scope_change_latest_block | awk '/Requested change/{flag=1; next} /AC impact/{flag=0} flag' | grep -Eo '^[[:space:]]*\+[[:space:]]+[A-Za-z0-9_./-]+' | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true)"; then
+        if [ -n "$LATEST_ID" ]; then
+          check "scope-change-complete" 1 "scope-change $LATEST_WHAT approved but plan-final.md has no Amendment naming $LATEST_ID — amend the plan before transitioning"
+        else
+          check "scope-change-complete" 1 "scope-change approved but plan-final.md has no Amendment naming its paths — amend the plan before transitioning"
+        fi
       else
         check "scope-change-complete" 0
       fi
     else
-      check "scope-change-complete" 1 "scope-change.md has no parseable User decision (pending|approved|rejected) — resolve before transitioning"
+      check "scope-change-complete" 1 "scope-change.md $LATEST_WHAT has no parseable User decision (pending|approved|rejected) — resolve before transitioning"
     fi
   else
     check "scope-change-complete" 0
@@ -392,12 +452,16 @@ tier_pass_at_head() { # tier_pass_at_head <tier> <head-sha> -> 0 if last block p
 }
 
 tier3_waived() { # 0 if a valid Small-task Tier 3 waiver exists
+  # Strict shape: a "User decision:" line carrying a YYYY-MM-DD date, a
+  # waiver verb, a Tier 3 reference, AND a parenthesized reason. A bare
+  # "waive tier 3" with no date or no reason does not count.
   local w="$TASK_DIR/reports/tier3-waiver.md"
   [ -f "$w" ] || return 1
   [ "$CLASS" = "Small" ] || return 1
-  grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}' "$w" || return 1
+  grep -Ei 'user decision[[:space:]]*:' "$w" | grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}' || return 1
   grep -Eqi 'waiv' "$w" || return 1
-  grep -Eqi 'tier ?3|full suite|full' "$w"
+  grep -Eqi 'tier ?3|full suite|full' "$w" || return 1
+  grep -Eq '\([^)]*(reason|because|rational|justif)' "$w"
 }
 
 gate_preflight() {
@@ -439,6 +503,21 @@ gate_preflight() {
     check "preflight-on-branch" 0
   else
     check "preflight-on-branch" 1 "detached HEAD at $(git rev-parse --short HEAD) — use the Detached HEAD menu"
+  fi
+
+  # The branch being integrated must be the recorded task branch: integrating
+  # from any other checkout would test one ref and merge another.
+  if [ -z "$TASK_BRANCH" ]; then
+    check "preflight-task-branch" 1 "summary.md Git State must record Task branch"
+  else
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    if [ "$CURRENT_BRANCH" = "$TASK_BRANCH" ]; then
+      check "preflight-task-branch" 0
+    elif [ "$TASK_BRANCH" = "HEAD" ]; then
+      check "preflight-task-branch" 0
+    else
+      check "preflight-task-branch" 1 "on branch '$CURRENT_BRANCH' but Task branch is '$TASK_BRANCH' — checkout the task branch before integrating"
+    fi
   fi
 }
 

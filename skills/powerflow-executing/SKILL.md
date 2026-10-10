@@ -30,6 +30,14 @@ description: Load when an approved plan exists. Implements Small tasks directly 
    merge-base of target and HEAD at isolate time, `TASK_BRANCH` → Task branch,
    plus `Isolation: <ACTION> — <date>`). The branch the session started on is NOT
    necessarily the base — record them as separate fields; Finishing needs the base.
+   - `ACTION=created`: fresh `powerflow/<slug>` branch; Base SHA equals HEAD at
+     isolate time.
+   - `ACTION=reused`: continuing directly on an existing branch (e.g. a feature
+     branch with its own upstream). The existing branch is the TASK branch; the
+     Base branch stays the integration target and Base SHA is the fork point.
+     A branch tracking `origin/itself` is never taken as the integration target
+     (falls back to repo default); a resolved base equal to the current branch
+     is an error — pass the real merge target explicitly.
 
 ## 2. Implement
 
@@ -61,13 +69,15 @@ Spawn a subagent using the **Implementation Reviewer** prompt. It writes `<task-
 ## Non-Negotiable Behaviors
 
 - **Scope lock with recorded expansion only**: never edit, create, or delete a file
-  outside the contract's Scope. If the scope proves insufficient: STOP, write
-  `<task-dir>/reports/scope-change.md` (Trigger / Evidence `file:line` / Requested
-  change / AC impact / User decision / Re-review), get the user's recorded approval,
-  amend `plan-final.md` (date + added paths + reason), and re-run the appropriate
-  reviewer before resuming. Never expand scope silently. An approved scope-change does
-  NOT reset the 3-round review cap. `validate-transition.sh` accepts out-of-scope
-  diffs only when covered by an approved `scope-change.md`.
+  outside the contract's Scope. If the scope proves insufficient: STOP, append a
+  new `## Request SC-00X` block to `<task-dir>/reports/scope-change.md` (Trigger /
+  Evidence `file:line` / Requested change / AC impact / User decision / Re-review —
+  format in [powerflow-planning](../powerflow-planning/SKILL.md)), get the user's
+  recorded approval, amend `plan-final.md` (date + request ID + added paths + reason),
+  and re-run the appropriate reviewer before resuming. Never expand scope silently.
+  An approved scope-change does NOT reset the 3-round review cap.
+  `validate-transition.sh` accepts out-of-scope diffs only when covered by the
+  LATEST request block fully completed (approved + amended + re-reviewed ACCEPTED).
 - **Verification cycle per step**: failing test (or concrete command check for non-testable tasks) → minimal implementation → verification passes → atomic commit with the task ID. Never group steps into one commit.
 - **Never self-approve** (Big): implementation and coverage checks are delegated to an independent subagent.
 - **Failure stops the pipeline**: stop and report; never silently patch or skip a failure.

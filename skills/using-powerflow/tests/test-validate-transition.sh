@@ -148,9 +148,11 @@ sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TA
 OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
 assert_exit "validator-scope-leak" 1 "$CODE"
 assert_contains "validator-scope-leak-check" "$OUT" "CHECK diff-scope: FAIL"
-# 7b. Same leak WITH complete approved scope-change (amendment + re-review) -> PASS
+# 7b. Same leak WITH complete approved scope-change (Request ID + amendment + re-review) -> PASS
 cat > "$TASK/reports/scope-change.md" <<EOF
-# Scope change request — 2026-01-01
+# Scope changes — 2026-01-01
+
+## Request SC-001 — 2026-01-01
 Trigger: needed helper
 Evidence: src_app.py:1 needs extra_leak.py
 Requested change:
@@ -161,8 +163,8 @@ Re-review: implementation-review.md ACCEPTED
 EOF
 cat >> "$TASK/plans/plan-final.md" <<EOF
 
-## Amendment — 2026-01-01
-Added extra_leak.py (reason: needed helper, scope-change 2026-01-01).
+## Amendment — 2026-01-01 (SC-001)
+Added extra_leak.py (reason: needed helper, scope-change SC-001).
 EOF
 (cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing >/dev/null 2>&1); CODE=$?
 assert_exit "validator-scope-change-approved" 0 "$CODE"
@@ -248,7 +250,9 @@ git -C "$REPO" commit -q -m "TASK-003: leak"
 NEWSHA=$(git -C "$REPO" rev-parse HEAD)
 sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
 cat > "$TASK/reports/scope-change.md" <<EOF
-# Scope change request — 2026-01-01
+# Scope changes — 2026-01-01
+
+## Request SC-001 — 2026-01-01
 Trigger: needed helper
 Evidence: src_app.py:1 needs extra_leak.py
 Requested change:
@@ -261,10 +265,12 @@ assert_exit "validator-scope-incomplete" 1 "$CODE"
 assert_contains "validator-scope-incomplete-check" "$OUT" "CHECK scope-change-complete: FAIL"
 rm -rf "$REPO"; trap - EXIT
 
-# 14. Stale decision: old approved + new pending -> pending wins (FAIL)
+# 14. Stale decision: old approved SC-001 + new pending SC-002 -> pending wins (FAIL)
 read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
 cat > "$TASK/reports/scope-change.md" <<EOF
-# Scope change request — 2026-01-01
+# Scope changes
+
+## Request SC-001 — 2026-01-01
 Trigger: old
 Evidence: src_app.py:1
 Requested change:
@@ -273,7 +279,7 @@ AC impact: none
 User decision: approved 2026-01-01 old
 Re-review: implementation-review.md ACCEPTED
 
-# Scope change request — 2026-01-02
+## Request SC-002 — 2026-01-02
 Trigger: new
 Evidence: src_app.py:2
 Requested change:
@@ -294,7 +300,9 @@ git -C "$REPO" commit -q -m "TASK-003: leak"
 NEWSHA=$(git -C "$REPO" rev-parse HEAD)
 sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
 cat > "$TASK/reports/scope-change.md" <<EOF
-# Scope change request — 2026-01-01
+# Scope changes — 2026-01-01
+
+## Request SC-001 — 2026-01-01
 Trigger: cleanup
 Evidence: src_app.py:1
 Requested change:
@@ -305,8 +313,8 @@ Re-review: implementation-review.md ACCEPTED
 EOF
 cat >> "$TASK/plans/plan-final.md" <<EOF
 
-## Amendment — 2026-01-01
-Removed extra_leak.py (reason: cleanup, scope-change 2026-01-01).
+## Amendment — 2026-01-01 (SC-001)
+Removed extra_leak.py (reason: cleanup, scope-change SC-001).
 EOF
 OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
 assert_exit "validator-scope-removal" 1 "$CODE"
@@ -377,6 +385,62 @@ assert_exit "validator-preflight-waiver" 0 "$CODE"
 assert_contains "validator-preflight-waiver-t3" "$OUT" "CHECK preflight-tier3: PASS"
 rm -rf "$REPO"; trap - EXIT
 
+# 20b. Waiver WITHOUT parenthesized reason -> FAIL tier3
+read -r REPO TASK < <(make_passing_task Small); trap 'rm -rf "$REPO"' EXIT
+python3 - "$TASK/executions/pre-integration-test-run.log" <<'PYEOF'
+import sys
+p = sys.argv[1]
+lines = open(p).read().splitlines(keepends=True)
+out, cur, skip = [], None, False
+for ln in lines:
+    if ln.startswith('TIER:'):
+        cur = ln.split(':')[1].strip()
+        skip = (cur == 'full')
+    if not skip:
+        out.append(ln)
+open(p, 'w').writelines(out)
+PYEOF
+cat > "$TASK/reports/tier3-waiver.md" <<EOF
+# Tier 3 waiver — 2026-01-01
+User decision: 2026-01-01 waive Tier 3 full suite.
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --preflight 2>/dev/null); CODE=$?
+assert_exit "validator-preflight-waiver-noreason" 1 "$CODE"
+assert_contains "validator-preflight-waiver-noreason-t3" "$OUT" "CHECK preflight-tier3: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
+# 20c. Waiver WITHOUT date/user-decision line -> FAIL tier3
+read -r REPO TASK < <(make_passing_task Small); trap 'rm -rf "$REPO"' EXIT
+python3 - "$TASK/executions/pre-integration-test-run.log" <<'PYEOF'
+import sys
+p = sys.argv[1]
+lines = open(p).read().splitlines(keepends=True)
+out, cur, skip = [], None, False
+for ln in lines:
+    if ln.startswith('TIER:'):
+        cur = ln.split(':')[1].strip()
+        skip = (cur == 'full')
+    if not skip:
+        out.append(ln)
+open(p, 'w').writelines(out)
+PYEOF
+cat > "$TASK/reports/tier3-waiver.md" <<EOF
+# Tier 3 waiver
+Skipping full suite (reason: in a hurry).
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --preflight 2>/dev/null); CODE=$?
+assert_exit "validator-preflight-waiver-nodate" 1 "$CODE"
+assert_contains "validator-preflight-waiver-nodate-t3" "$OUT" "CHECK preflight-tier3: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
+# 20d. Preflight on the WRONG branch (not the recorded Task branch) -> FAIL
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+git -C "$REPO" checkout -q main
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --preflight 2>/dev/null); CODE=$?
+assert_exit "validator-preflight-wrong-branch" 1 "$CODE"
+assert_contains "validator-preflight-wrong-branch-check" "$OUT" "CHECK preflight-task-branch: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
 # 21. Preflight: Big + Tier3 waiver file -> still FAIL (waivers are Small-only)
 read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
 python3 - "$TASK/executions/pre-integration-test-run.log" <<'PYEOF'
@@ -401,7 +465,7 @@ assert_exit "validator-preflight-big-nowaiver" 1 "$CODE"
 assert_contains "validator-preflight-big-nowaiver-t3" "$OUT" "CHECK preflight-tier3: FAIL"
 rm -rf "$REPO"; trap - EXIT
 
-# 22. Complete approved scope-change (amendment + ACCEPTED re-review) -> PASS
+# 22. Complete approved scope-change (Request ID + amendment + ACCEPTED re-review) -> PASS
 read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
 printf 'oops\n' > "$REPO/extra_leak.py"
 git -C "$REPO" add extra_leak.py
@@ -409,7 +473,9 @@ git -C "$REPO" commit -q -m "TASK-003: leak"
 NEWSHA=$(git -C "$REPO" rev-parse HEAD)
 sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
 cat > "$TASK/reports/scope-change.md" <<EOF
-# Scope change request — 2026-01-01
+# Scope changes — 2026-01-01
+
+## Request SC-001 — 2026-01-01
 Trigger: needed helper
 Evidence: src_app.py:1 needs extra_leak.py
 Requested change:
@@ -420,11 +486,130 @@ Re-review: implementation-review.md ACCEPTED
 EOF
 cat >> "$TASK/plans/plan-final.md" <<EOF
 
-## Amendment — 2026-01-01
-Added extra_leak.py (reason: needed helper, scope-change 2026-01-01).
+## Amendment — 2026-01-01 (SC-001)
+Added extra_leak.py (reason: needed helper, scope-change SC-001).
 EOF
 (cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing >/dev/null 2>&1); CODE=$?
 assert_exit "validator-scope-complete" 0 "$CODE"
+rm -rf "$REPO"; trap - EXIT
+
+# 23. OLD approved SC-001 does NOT cover the diff when LATEST SC-002 is pending
+#     (only the latest completed request widens scope)
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+printf 'oops\n' > "$REPO/extra_leak.py"
+git -C "$REPO" add extra_leak.py
+git -C "$REPO" commit -q -m "TASK-003: leak"
+NEWSHA=$(git -C "$REPO" rev-parse HEAD)
+sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes
+
+## Request SC-001 — 2026-01-01
+Trigger: needed helper
+Evidence: src_app.py:1 needs extra_leak.py
+Requested change:
++ extra_leak.py
+AC impact: none
+User decision: approved 2026-01-01 go ahead
+Re-review: implementation-review.md ACCEPTED
+
+## Request SC-002 — 2026-01-02
+Trigger: second helper
+Evidence: src_app.py:2 needs another.py
+Requested change:
++ another.py
+AC impact: none
+User decision: pending
+EOF
+cat >> "$TASK/plans/plan-final.md" <<EOF
+
+## Amendment — 2026-01-01 (SC-001)
+Added extra_leak.py (reason: needed helper, scope-change SC-001).
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
+assert_exit "validator-scope-old-approved" 1 "$CODE"
+assert_contains "validator-scope-old-approved-scope" "$OUT" "CHECK scope-change-complete: FAIL"
+assert_contains "validator-scope-old-approved-diff" "$OUT" "CHECK diff-scope: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
+# 24. Amendment naming the WRONG request ID does not complete SC-002
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+printf 'oops\n' > "$REPO/extra_leak.py"
+git -C "$REPO" add extra_leak.py
+git -C "$REPO" commit -q -m "TASK-003: leak"
+NEWSHA=$(git -C "$REPO" rev-parse HEAD)
+sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes
+
+## Request SC-001 — 2026-01-01
+Trigger: old helper
+Evidence: src_app.py:1 needs old.py
+Requested change:
++ old.py
+AC impact: none
+User decision: approved 2026-01-01 old
+Re-review: implementation-review.md ACCEPTED
+
+## Request SC-002 — 2026-01-02
+Trigger: needed helper
+Evidence: src_app.py:1 needs extra_leak.py
+Requested change:
++ extra_leak.py
+AC impact: none
+User decision: approved 2026-01-02 go ahead
+Re-review: implementation-review.md ACCEPTED
+EOF
+cat >> "$TASK/plans/plan-final.md" <<EOF
+
+## Amendment — 2026-01-01 (SC-001)
+Added old.py (reason: old helper, scope-change SC-001).
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
+assert_exit "validator-scope-wrong-amend" 1 "$CODE"
+assert_contains "validator-scope-wrong-amend-scope" "$OUT" "CHECK scope-change-complete: FAIL"
+assert_contains "validator-scope-wrong-amend-diff" "$OUT" "CHECK diff-scope: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
+# 25. Two completed requests: latest SC-002 approved+amended+reviewed -> PASS
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+printf 'oops\n' > "$REPO/extra_leak.py"
+git -C "$REPO" add extra_leak.py
+git -C "$REPO" commit -q -m "TASK-003: leak"
+NEWSHA=$(git -C "$REPO" rev-parse HEAD)
+sed -i "s/^SHA: .*$/SHA: $NEWSHA/; s/^Tested SHA: .*$/Tested SHA: $NEWSHA/" "$TASK/executions/pre-integration-test-run.log" "$TASK/executions/verification-ledger.md"
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes
+
+## Request SC-001 — 2026-01-01
+Trigger: old helper
+Evidence: src_app.py:1 needs old.py
+Requested change:
++ old.py
+AC impact: none
+User decision: approved 2026-01-01 old
+Re-review: implementation-review.md ACCEPTED
+
+## Request SC-002 — 2026-01-02
+Trigger: needed helper
+Evidence: src_app.py:1 needs extra_leak.py
+Requested change:
++ extra_leak.py
+AC impact: none
+User decision: approved 2026-01-02 go ahead
+Re-review: implementation-review.md ACCEPTED
+EOF
+cat >> "$TASK/plans/plan-final.md" <<EOF
+
+## Amendment — 2026-01-01 (SC-001)
+Added old.py (reason: old helper, scope-change SC-001).
+
+## Amendment — 2026-01-02 (SC-002)
+Added extra_leak.py (reason: needed helper, scope-change SC-002).
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
+assert_exit "validator-scope-two-complete" 0 "$CODE"
+assert_contains "validator-scope-two-complete-diff" "$OUT" "CHECK diff-scope: PASS"
 rm -rf "$REPO"; trap - EXIT
 
 summary_of

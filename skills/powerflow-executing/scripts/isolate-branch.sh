@@ -64,6 +64,9 @@ fi
 
 # --base-branch names the INTEGRATION target (may differ from current branch).
 # Empty means: resolve from upstream, else repo default, else fail.
+# A self-upstream (branch tracking origin/itself, e.g. feature/foo tracking
+# origin/feature/foo) is NOT an integration target: it is the task branch's
+# own remote, so it is skipped during resolution.
 if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
   INTEGRATION_BASE="$BASE_BRANCH_OVERRIDE"
 else
@@ -71,8 +74,13 @@ else
   # 1. Upstream of the current branch (e.g. feature/foo tracking origin/main).
   UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
   if [ -n "$UPSTREAM" ]; then
-    # Strip remote prefix: origin/main -> main.
-    INTEGRATION_BASE=$(printf '%s' "$UPSTREAM" | sed -E 's|^[^/]+/||')
+    UPSTREAM_SHORT=$(printf '%s' "$UPSTREAM" | sed -E 's|^[^/]+/||')
+    if [ "$UPSTREAM_SHORT" = "$CURRENT" ]; then
+      echo "Note: upstream $UPSTREAM tracks this branch itself — not an integration target; falling back to repo default." >&2
+    else
+      # Strip remote prefix: origin/main -> main.
+      INTEGRATION_BASE="$UPSTREAM_SHORT"
+    fi
   fi
   # 2. Repo default: origin/HEAD target, else main/master if present.
   if [ -z "$INTEGRATION_BASE" ]; then
@@ -149,7 +157,16 @@ if [ "$SHOULD_ISOLATE" = true ]; then
   TASK_BRANCH="$POWERFLOW_BRANCH"
   ACTION="created"
 else
+  # Reused branch: continuing directly on existing work. Guard against a
+  # self-merge recording (base == task branch would make BASE_SHA == HEAD
+  # and the diff-scope check vacuous).
+  if [ "$INTEGRATION_BASE" = "$CURRENT" ]; then
+    echo "Error: integration base '$INTEGRATION_BASE' is the current branch itself — continuing here would record a self-merge baseline." >&2
+    echo "Pass the real merge target explicitly: --base-branch <branch>." >&2
+    exit 1
+  fi
   echo "On existing branch '$CURRENT'. No isolation needed."
+  echo "Continuing directly on '$CURRENT': it is the TASK branch; the recorded Base branch stays the integration target." >&2
   TASK_BRANCH="$CURRENT"
   ACTION="reused"
 fi
