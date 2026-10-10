@@ -170,30 +170,38 @@ Which option?
     1. Run the Preflight (Section 4).
     2. Ensure changes are committed.
     3. Resolve the integration branch (Section 3, step 2).
-    4. Locate the merge:
+    4. Sync the integration branch BEFORE merging (same contract for both
+       locations in step 5):
+       - If the branch has an upstream (`git -C <loc> rev-parse --abbrev-ref --symbolic-full-name '@{u}'`
+         succeeds): run `git -C <loc> pull --ff-only`.
+         - On FAILURE: STOP and report. A failed pull (divergence, conflicts,
+           unreachable remote) is NOT consent to skip — never continue offline
+           without a NEW explicit user decision.
+       - If the branch has NO upstream: ask the user whether to skip the pull,
+         or record an explicit decision to skip in `summary.md` before
+         continuing.
+       - When the user chooses offline: record it verbatim in `summary.md`
+         (e.g. `offline, skipped pull — <date>`) before proceeding.
+    5. Locate the merge and merge there:
        - **Main checkout** (current worktree already on, or free to checkout,
-         the integration branch): checkout the integration branch there,
-         confirm attached (`git symbolic-ref -q HEAD`), pull latest (or record
-         "offline, skipped pull"; pull follows the branch's own tracking —
-         do not assume `origin`), then merge.
+         the integration branch): checkout the integration branch, confirm
+         attached (`git symbolic-ref -q HEAD`), then merge.
        - **Task worktree** (integration branch checked out in ANOTHER
          worktree, so this worktree cannot take it): do NOT checkout — run
-         the merge in the worktree that owns the integration branch.
-         First pull there explicitly (before merging):
+         the sync (step 4) and merge in the worktree that owns the
+         integration branch:
          ```bash
          MAIN_ROOT=$(git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel)
-         git -C "$MAIN_ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}'  # upstream present?
-         git -C "$MAIN_ROOT" pull --ff-only    # or record "offline, skipped pull" when no upstream/offline
          git -C "$MAIN_ROOT" merge --ff-only <task-branch> || git -C "$MAIN_ROOT" merge <task-branch>
          ```
          (Replace `$MAIN_ROOT` with the owning worktree's path from
          `git worktree list --porcelain` when the integration branch lives
          elsewhere. Verify there (step 6) — never here.)
-    5. Merge: `git merge --ff-only powerflow/<task-slug> || git merge powerflow/<task-slug>`
-       (in the worktree from step 4).
+       Merge command: `git merge --ff-only powerflow/<task-slug> || git merge powerflow/<task-slug>`
+       (in the chosen worktree).
        For complex merges, spawn an **Integrator** subagent instead — it executes the
-       merge + verification; the orchestrator only coordinates choices. Never run two
-       overlapping merges.
+       sync + merge + verification; the orchestrator only coordinates choices. Never
+       run two overlapping merges.
     6. Run tiered verification (Section 2) on the MERGED result (in the same
        worktree as the merge).
     7. Only on success, in this order:
