@@ -63,8 +63,9 @@ rm -rf "$TMP"; trap - EXIT
 #     target: falls back to repo default (main), task branch stays the feature.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 git -C "$TMP" checkout -qb feature/example
+git -C "$TMP" remote add origin /dev/null
 git -C "$TMP" update-ref refs/remotes/origin/feature/example refs/heads/feature/example
-git -C "$TMP" branch --set-upstream-to=refs/remotes/origin/feature/example 2>/dev/null
+git -C "$TMP" branch --set-upstream-to=origin/feature/example 2>/dev/null
 OUT=$(cd "$TMP" && bash "$ISOLATE" --task-slug feat2e --porcelain 2>/dev/null); CODE=$?
 assert_exit "isolate-self-upstream-exit" 0 "$CODE"
 assert_contains "isolate-self-upstream-base" "$OUT" "^BASE_BRANCH=main$"
@@ -88,31 +89,41 @@ rm -rf "$TMP"; trap - EXIT
 #     no main/master/origin/HEAD left.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 git -C "$TMP" checkout -qb solo
+git -C "$TMP" remote add origin /dev/null
 git -C "$TMP" update-ref refs/remotes/origin/solo refs/heads/solo
-git -C "$TMP" branch --set-upstream-to=refs/remotes/origin/solo 2>/dev/null
+git -C "$TMP" branch --set-upstream-to=origin/solo 2>/dev/null
 git -C "$TMP" branch -D main
 (cd "$TMP" && bash "$ISOLATE" --task-slug feat2g >/dev/null 2>&1); CODE=$?
 assert_exit "isolate-self-merge-guard" 1 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
-# 2h. Multi-remote: origin/main and upstream/main diverge; branch tracking
-#     upstream/main resolves BASE to upstream's main (fork point), not local's.
+# 2h. Multi-remote: the task branch tracks upstream/main, which has advanced
+#     past local/origin main. merge-base(HEAD, upstream/main) is genuinely
+#     newer than merge-base(HEAD, main): the recorded BASE_SHA must come from
+#     the upstream ref, and BASE_REF must name it.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
-git -C "$TMP" checkout -qb work
+git -C "$TMP" remote add origin /dev/null
+git -C "$TMP" remote add upstream /dev/null
 git -C "$TMP" update-ref refs/remotes/origin/main refs/heads/main
-# upstream/main points at a different commit than origin/main:
-git -C "$TMP" commit -q --allow-empty -m "upstream-only"
+# upstream/main advances one commit beyond local main:
+git -C "$TMP" checkout -qb tmp-up
+commit_file "$TMP" u.txt "upstream" "upstream commit"
 git -C "$TMP" update-ref refs/remotes/upstream/main HEAD
-git -C "$TMP" reset -q --hard refs/remotes/origin/main
-git -C "$TMP" branch --set-upstream-to=refs/remotes/upstream/main 2>/dev/null
-UPSTREAM_MAIN_SHA=$(git -C "$TMP" rev-parse refs/remotes/upstream/main)
+git -C "$TMP" checkout -q main
+git -C "$TMP" branch -D tmp-up
+# Task branch forks FROM upstream/main and adds work:
+git -C "$TMP" checkout -qb work refs/remotes/upstream/main
+commit_file "$TMP" w.txt "work" "work commit"
+git -C "$TMP" branch --set-upstream-to=upstream/main 2>/dev/null
 OUT=$(cd "$TMP" && bash "$ISOLATE" --task-slug feat2h --porcelain 2>/dev/null); CODE=$?
 assert_exit "isolate-multiremote-exit" 0 "$CODE"
 assert_contains "isolate-multiremote-base" "$OUT" "^BASE_BRANCH=main$"
+assert_contains "isolate-multiremote-ref" "$OUT" "^BASE_REF=upstream/main$"
 PORC_SHA=$(printf '%s' "$OUT" | grep '^BASE_SHA=' | cut -d= -f2)
-FORK=$(git -C "$TMP" merge-base HEAD refs/remotes/upstream/main)
-[ "$PORC_SHA" = "$FORK" ] && pass "isolate-multiremote-sha" || fail "isolate-multiremote-sha" "BASE_SHA=$PORC_SHA expected fork $FORK with upstream/main"
-[ "$PORC_SHA" != "$UPSTREAM_MAIN_SHA" ] && pass "isolate-multiremote-not-upstream-head" || fail "isolate-multiremote-not-upstream-head" "BASE_SHA must be the fork point, not upstream/main HEAD"
+FORK_UPSTREAM=$(git -C "$TMP" merge-base HEAD refs/remotes/upstream/main)
+FORK_LOCAL=$(git -C "$TMP" merge-base HEAD main)
+[ "$PORC_SHA" = "$FORK_UPSTREAM" ] && pass "isolate-multiremote-sha" || fail "isolate-multiremote-sha" "BASE_SHA=$PORC_SHA expected upstream fork $FORK_UPSTREAM"
+[ "$FORK_UPSTREAM" != "$FORK_LOCAL" ] && pass "isolate-multiremote-diverged" || fail "isolate-multiremote-diverged" "fixture invalid: forks identical ($FORK_UPSTREAM)"
 rm -rf "$TMP"; trap - EXIT
 
 # 3a. --base-branch match -> ok; 3b. unknown base -> exit 1

@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Squashes all commits on the current branch back to the base branch.
 # Base is NEVER guessed: pass --base-branch explicitly or --task-dir so the
-# base is read from <task-dir>/summary.md Git State (Base branch field).
+# base is read from <task-dir>/summary.md Git State (Base ref field preferred,
+# Base branch as fallback for older summaries).
 # Usage:
 #   squash-branch.sh --message "feat(task): summary" (--base-branch <branch> | --task-dir <dir>) [--allow-dirty]
 #   squash-branch.sh --uncommitted (--base-branch <branch> | --task-dir <dir>) [--allow-dirty]
@@ -44,36 +45,54 @@ if [ "$CURRENT_BRANCH" = "HEAD" ]; then
   exit 2
 fi
 
-# Base resolution: explicit flag > summary.md Git State > fail. Never guess.
+# Base resolution: explicit flag > summary.md Git State (Base ref, then Base
+# branch) > fail. Never guess. Base ref is the exact ref recorded at isolate
+# time (e.g. upstream/main); the short branch name alone is ambiguous when
+# remotes share branch names.
+BASE_REF=""
 if [ -z "$BASE_BRANCH" ] && [ -n "$TASK_DIR" ]; then
   SUMMARY="$TASK_DIR/summary.md"
   if [ -f "$SUMMARY" ]; then
+    BASE_REF=$(grep -E '^[*-][[:space:]]+Base ref:' "$SUMMARY" | head -n 1 | sed -E 's/^[*-][[:space:]]+Base ref:[[:space:]]*//; s/[[:space:]]*$//') || true
     BASE_BRANCH=$(grep -E '^[*-][[:space:]]+Base branch:' "$SUMMARY" | head -n 1 | sed -E 's/^[*-][[:space:]]+Base branch:[[:space:]]*//; s/[[:space:]]*$//') || true
-    if [ -n "$BASE_BRANCH" ]; then
-      echo "Base branch from $SUMMARY: $BASE_BRANCH" >&2
+    if [ -n "$BASE_REF" ]; then
+      echo "Base ref from $SUMMARY: $BASE_REF" >&2
+    elif [ -n "$BASE_BRANCH" ]; then
+      echo "Base branch from $SUMMARY: $BASE_BRANCH (no Base ref recorded)" >&2
     fi
   else
     echo "Warning: task summary not found at $SUMMARY" >&2
   fi
 fi
 
-if [ -z "$BASE_BRANCH" ]; then
-  echo "Error: base branch ambiguous. Pass --base-branch <branch> or --task-dir <dir>." >&2
-  exit 1
-fi
-
-# Verify the base ref exists locally or on origin, and keep the ref that
-# actually exists for merge-base below (a remote-only base must be addressed
-# as origin/<branch>, not as a missing local name).
-BASE_REF="$BASE_BRANCH"
-if git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
-  :
-elif git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
-  echo "Note: using remote-tracking base origin/$BASE_BRANCH" >&2
-  BASE_REF="origin/$BASE_BRANCH"
+if [ -n "$BASE_REF" ]; then
+  # Exact ref wins: verify it directly (local branch, full remote ref, or
+  # <remote>/<branch> shorthand).
+  if git show-ref --verify --quiet "refs/heads/$BASE_REF"     || git show-ref --verify --quiet "refs/remotes/$BASE_REF"     || git rev-parse --verify --quiet "$BASE_REF" >/dev/null; then
+    :
+  else
+    echo "Error: base ref '$BASE_REF' not found." >&2
+    exit 1
+  fi
 else
-  echo "Error: base branch '$BASE_BRANCH' not found (no refs/heads/$BASE_BRANCH or refs/remotes/origin/$BASE_BRANCH)" >&2
-  exit 1
+  if [ -z "$BASE_BRANCH" ]; then
+    echo "Error: base branch ambiguous. Pass --base-branch <branch> or --task-dir <dir>." >&2
+    exit 1
+  fi
+  # Fallback for summaries without Base ref: prefer local, then any remote.
+  BASE_REF="$BASE_BRANCH"
+  if git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
+    :
+  else
+    FOUND=$(git for-each-ref --format='%(refname:short)' "refs/remotes/*/$BASE_BRANCH" | head -n 1 || true)
+    if [ -n "$FOUND" ]; then
+      echo "Note: using remote-tracking base $FOUND" >&2
+      BASE_REF="$FOUND"
+    else
+      echo "Error: base branch '$BASE_BRANCH' not found (no local branch or remote-tracking ref)" >&2
+      exit 1
+    fi
+  fi
 fi
 
 # Dirty-tree guard — tracked staged/unstaged changes block the reset.

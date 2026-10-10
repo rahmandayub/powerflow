@@ -84,6 +84,7 @@ Next: Finishing
 
 ## Git State
 - Base branch: main
+- Base ref: main
 - Base SHA: $base_sha
 - Task branch: powerflow/demo
 - Isolation: created — 2026-01-01
@@ -119,6 +120,50 @@ read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
 rm "$TASK/reviews/plan-review.md"
 (cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from planning --to executing >/dev/null 2>&1); CODE=$?
 assert_exit "validator-missing-review-big" 1 "$CODE"
+rm -rf "$REPO"; trap - EXIT
+
+# 4b. Planning gate: latest request approved but NOT amended/reviewed -> FAIL
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes — 2026-01-01
+
+## Request SC-001 — 2026-01-01
+Trigger: needed helper
+Evidence: src_app.py:1 needs extra.py
+Requested change:
++ extra.py
+AC impact: none
+User decision: approved 2026-01-01 go ahead
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from planning --to executing 2>/dev/null); CODE=$?
+assert_exit "validator-planning-incomplete" 1 "$CODE"
+assert_contains "validator-planning-incomplete-check" "$OUT" "CHECK scope-change-pending: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
+# 4c. Planning gate: latest request with unparseable decision -> FAIL
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+cat > "$TASK/reports/scope-change.md" <<EOF
+# Scope changes — 2026-01-01
+
+## Request SC-001 — 2026-01-01
+Trigger: vague idea
+Evidence: src_app.py:1
+Requested change:
++ extra.py
+AC impact: none
+User decision: maybe later
+EOF
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from planning --to executing 2>/dev/null); CODE=$?
+assert_exit "validator-planning-unparseable" 1 "$CODE"
+assert_contains "validator-planning-unparseable-check" "$OUT" "CHECK scope-change-pending: FAIL"
+rm -rf "$REPO"; trap - EXIT
+
+# 4d. Git State with Base ref pointing at a missing ref -> FAIL diff-scope.
+read -r REPO TASK < <(make_passing_task Big); trap 'rm -rf "$REPO"' EXIT
+sed -i 's/^- Base ref: .*$/\- Base ref: upstream\/main/' "$TASK/summary.md"
+OUT=$(cd "$REPO" && bash "$VALIDATE" --task-dir "$TASK" --from executing --to finishing 2>/dev/null); CODE=$?
+assert_exit "validator-base-ref-missing" 1 "$CODE"
+assert_contains "validator-base-ref-missing-check" "$OUT" "CHECK diff-scope: FAIL"
 rm -rf "$REPO"; trap - EXIT
 
 # 5. Small task: no review files, scope-check.txt evidence -> both gates pass

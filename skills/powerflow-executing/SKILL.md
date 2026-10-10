@@ -25,10 +25,10 @@ description: Load when an approved plan exists. Implements Small tasks directly 
    - Exit 1 → error: report it and stop.
    - Exit 2 → detached HEAD: warn the user and use the detached-HEAD finishing menu; do not create a branch.
    - Exit 4 → dirty tree: STOP, ask the user to commit/stash or re-run with `--allow-dirty`.
-2. Write all four Git State fields to `summary.md` from the `--porcelain` output
-   (`BASE_BRANCH` → Base branch = integration target, `BASE_SHA` → Base SHA =
-   merge-base of target and HEAD at isolate time, `TASK_BRANCH` → Task branch,
-   plus `Isolation: <ACTION> — <date>`). The branch the session started on is NOT
+2. Write all five Git State fields to `summary.md` from the `--porcelain` output
+   (`BASE_BRANCH` → Base branch = short integration name, `BASE_REF` → Base ref =
+   exact ref, `BASE_SHA` → Base SHA = merge-base of ref and HEAD at isolate time,
+   `TASK_BRANCH` → Task branch, plus `Isolation: <ACTION> — <date>`). The branch the session started on is NOT
    necessarily the base — record them as separate fields; Finishing needs the base.
    - `ACTION=created`: fresh `powerflow/<slug>` branch; Base SHA equals HEAD at
      isolate time.

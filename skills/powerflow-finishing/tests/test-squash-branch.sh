@@ -133,4 +133,34 @@ COUNT=$(git -C "$TMP" rev-list --count "$(git -C "$TMP" merge-base HEAD origin/m
 [ "$COUNT" -eq 1 ] && pass "squash-remote-count" || fail "squash-remote-count" "count=$COUNT"
 rm -rf "$TMP"; trap - EXIT
 
+# 11. --task-dir prefers Base ref over Base branch: summary records
+#     Base branch main + Base ref upstream/main where upstream/main is NEWER.
+#     Squash must use upstream/main (1 commit), not stale local main (2).
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" remote add upstream /dev/null
+git -C "$TMP" checkout -qb tmp-up
+commit_file "$TMP" u.txt "upstream" "upstream commit"
+git -C "$TMP" update-ref refs/remotes/upstream/main HEAD
+git -C "$TMP" checkout -q main
+git -C "$TMP" branch -D tmp-up
+git -C "$TMP" checkout -qb "powerflow/td2" refs/remotes/upstream/main
+commit_file "$TMP" a.txt "1" "TASK-001: one"
+mkdir -p "$TMP/task"
+printf '# Powerflow Summary\n\n## Git State\n- Base branch: main\n- Base ref: upstream/main\n- Base SHA: x\n- Task branch: powerflow/td2\n' > "$TMP/task/summary.md"
+(cd "$TMP" && bash "$SQUASH" --message "x" --task-dir task >/dev/null 2>&1); CODE=$?
+assert_exit "squash-base-ref" 0 "$CODE"
+COUNT=$(git -C "$TMP" rev-list --count "$(git -C "$TMP" merge-base HEAD refs/remotes/upstream/main)"..HEAD)
+[ "$COUNT" -eq 1 ] && pass "squash-base-ref-count" || fail "squash-base-ref-count" "count=$COUNT (must squash to upstream/main, not stale main)"
+rm -rf "$TMP"; trap - EXIT
+
+# 12. --task-dir with unknown Base ref -> exit 1 (never silently fall back).
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" checkout -qb "powerflow/td3"
+commit_file "$TMP" a.txt "1" "TASK-001: one"
+mkdir -p "$TMP/task"
+printf '# Powerflow Summary\n\n## Git State\n- Base branch: main\n- Base ref: upstream/main\n- Base SHA: x\n- Task branch: powerflow/td3\n' > "$TMP/task/summary.md"
+(cd "$TMP" && bash "$SQUASH" --message "x" --task-dir task >/dev/null 2>&1); CODE=$?
+assert_exit "squash-base-ref-unknown" 1 "$CODE"
+rm -rf "$TMP"; trap - EXIT
+
 summary_of

@@ -122,8 +122,16 @@ git_state_field() { # git_state_field <label>
 }
 
 BASE_BRANCH=$(git_state_field "Base branch")
+BASE_REF_STATE=$(git_state_field "Base ref")
 BASE_SHA=$(git_state_field "Base SHA")
 TASK_BRANCH=$(git_state_field "Task branch")
+# Effective base ref for ancestry/diff checks: the exact recorded ref when
+# present (e.g. upstream/main), else the short branch name (older summaries).
+if [ -n "$BASE_REF_STATE" ]; then
+  BASE_REF="$BASE_REF_STATE"
+else
+  BASE_REF="$BASE_BRANCH"
+fi
 
 # Verdict token, case-sensitive: prefers a "Verdict:"-prefixed line
 # ("## Verdict: ACCEPTED") and falls back to the last bare token ("- APPROVED").
@@ -182,14 +190,23 @@ gate_planning_executing() {
 
   SC="$TASK_DIR/reports/scope-change.md"
   if [ -f "$SC" ]; then
-    # Same latest-block rule as the executing gate: a stale pending line in
-    # an older request must not block once a newer request supersedes it.
-    SC_DECISION=$(scope_change_latest_decision)
-    if [ "$SC_DECISION" = "pending" ]; then
-      check "scope-change-pending" 1 "scope-change.md latest request User decision is pending — resolve before transitioning"
-    else
-      check "scope-change-pending" 0
-    fi
+    # Full shared policy: the planning gate must not let an incomplete
+    # approval through only to fail at the end of implementation.
+    SC_STATUS=$(scope_change_policy)
+    case "$SC_STATUS" in
+      ok-none|ok-rejected|ok-complete)
+        check "scope-change-pending" 0
+        ;;
+      fail-pending)
+        check "scope-change-pending" 1 "scope-change.md latest request User decision is pending — resolve before transitioning"
+        ;;
+      fail-unparseable)
+        check "scope-change-pending" 1 "scope-change.md latest request has no parseable User decision (pending|approved|rejected) — resolve before transitioning"
+        ;;
+      fail-rereview|fail-amendment|fail-paths:*)
+        check "scope-change-pending" 1 "scope-change.md latest request approved but protocol incomplete ($SC_STATUS) — amend the plan and re-run the reviewer before transitioning"
+        ;;
+    esac
   else
     check "scope-change-pending" 0
   fi
@@ -248,6 +265,52 @@ scope_change_latest_decision() { # prints the LATEST request's "User decision:" 
   scope_change_latest_block 2>/dev/null \
     | grep -Ei 'user decision[[:space:]]*:' \
     | tail -n 1 | grep -Eo '(approved|pending|rejected)\b' -i | tr '[:upper:]' '[:lower:]' || true
+}
+
+# Shared scope-change policy for BOTH gates (planning->executing and
+# executing->finishing): evaluates the LATEST request block and echoes one of:
+#   ok-none      (no scope-change.md)
+#   ok-rejected  (latest decision rejected)
+#   ok-complete  (latest approved + amended + re-reviewed ACCEPTED)
+#   fail-pending | fail-unparseable | fail-rereview | fail-amendment | fail-paths:<...>
+scope_change_policy() {
+  local sc="$TASK_DIR/reports/scope-change.md"
+  if [ ! -f "$sc" ]; then
+    echo "ok-none"
+    return 0
+  fi
+  local decision req_id
+  decision=$(scope_change_latest_decision)
+  req_id=$(scope_change_latest_id)
+  if [ -n "$req_id" ]; then
+    WHAT="request $req_id"
+  else
+    WHAT="latest request"
+  fi
+  if [ "$decision" = "pending" ]; then
+    echo "fail-pending"
+  elif [ "$decision" = "rejected" ]; then
+    echo "ok-rejected"
+  elif [ "$decision" = "approved" ]; then
+    local paths
+    paths=$(scope_change_latest_block | awk '/Requested change/{flag=1; next} /AC impact/{flag=0} flag' | grep -Eo '^[[:space:]]*\+[[:space:]]+[A-Za-z0-9_./-]+' | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true)
+    if ! scope_change_rereview_accepted; then
+      echo "fail-rereview"
+    elif ! plan_amendment_names "$req_id" "$paths"; then
+      echo "fail-amendment"
+    else
+      local unamended
+      # shellcheck disable=SC2086
+      unamended=$(comm -23 <(printf '%s\n' $paths | sort -u) <(amended_paths_only "$req_id" $paths | sort -u) || true)
+      if [ -n "$unamended" ]; then
+        printf 'fail-paths:%s' "$(printf ' %s' $unamended)"
+      else
+        echo "ok-complete"
+      fi
+    fi
+  else
+    echo "fail-unparseable"
+  fi
 }
 
 scope_change_rereview_accepted() { # 0 if the LATEST "Re-review:" line in the latest block says ACCEPTED
@@ -373,55 +436,53 @@ gate_executing_finishing() {
     check "ac-evidence" 1 "AC ids without PASS + evidence in verification-ledger.md (or scope-check.txt):$MISSING_AC"
   fi
 
-  # Scope-change protocol completion, per LATEST "## Request" block: a pending
-  # or undecided latest request blocks; an approved-but-incomplete request
-  # (no ACCEPTED re-review in its block, or no Amendment naming its ID/paths)
-  # also blocks, so '+' paths are never trusted early. Older approved
-  # requests never widen scope — only the latest completed one does.
+  # Scope-change protocol completion via the shared policy: only the LATEST
+  # "## Request" block counts; older approved requests never widen scope.
   SC_FILE="$TASK_DIR/reports/scope-change.md"
   if [ -f "$SC_FILE" ]; then
-    LATEST_DECISION=$(scope_change_latest_decision)
     LATEST_ID=$(scope_change_latest_id)
     if [ -n "$LATEST_ID" ]; then
       LATEST_WHAT="request $LATEST_ID"
     else
       LATEST_WHAT="latest request"
     fi
-    if [ "$LATEST_DECISION" = "pending" ]; then
-      check "scope-change-complete" 1 "scope-change.md $LATEST_WHAT User decision is pending — resolve before transitioning"
-    elif [ "$LATEST_DECISION" = "rejected" ]; then
-      check "scope-change-complete" 0
-    elif [ "$LATEST_DECISION" = "approved" ]; then
-      LATEST_PATHS=$(scope_change_latest_block | awk '/Requested change/{flag=1; next} /AC impact/{flag=0} flag' | grep -Eo '^[[:space:]]*\+[[:space:]]+[A-Za-z0-9_./-]+' | sed -E 's/^[[:space:]]*\+[[:space:]]+//' || true)
-      if ! scope_change_rereview_accepted; then
+    SC_STATUS=$(scope_change_policy)
+    case "$SC_STATUS" in
+      ok-none|ok-rejected|ok-complete)
+        check "scope-change-complete" 0
+        ;;
+      fail-pending)
+        check "scope-change-complete" 1 "scope-change.md $LATEST_WHAT User decision is pending — resolve before transitioning"
+        ;;
+      fail-unparseable)
+        check "scope-change-complete" 1 "scope-change.md $LATEST_WHAT has no parseable User decision (pending|approved|rejected) — resolve before transitioning"
+        ;;
+      fail-rereview)
         check "scope-change-complete" 1 "scope-change $LATEST_WHAT approved but its latest Re-review verdict is not ACCEPTED — re-run the reviewer before transitioning"
-      elif ! plan_amendment_names "$LATEST_ID" "$LATEST_PATHS"; then
+        ;;
+      fail-amendment)
         if [ -n "$LATEST_ID" ]; then
           check "scope-change-complete" 1 "scope-change $LATEST_WHAT approved but plan-final.md has no Amendment naming $LATEST_ID — amend the plan before transitioning"
         else
           check "scope-change-complete" 1 "scope-change approved but plan-final.md has no Amendment naming its paths — amend the plan before transitioning"
         fi
-      else
-        # shellcheck disable=SC2086
-        UNAMENDED=$(comm -23 <(printf '%s\n' $LATEST_PATHS | sort -u) <(amended_paths_only "$LATEST_ID" $LATEST_PATHS | sort -u) || true)
-        if [ -n "$UNAMENDED" ]; then
-          check "scope-change-complete" 1 "scope-change $LATEST_WHAT amendment omits approved paths:$(printf ' %s' $UNAMENDED) — amend every path before transitioning"
-        else
-          check "scope-change-complete" 0
-        fi
-      fi
-    else
-      check "scope-change-complete" 1 "scope-change.md $LATEST_WHAT has no parseable User decision (pending|approved|rejected) — resolve before transitioning"
-    fi
+        ;;
+      fail-paths:*)
+        MISSING=${SC_STATUS#fail-paths:}
+        check "scope-change-complete" 1 "scope-change $LATEST_WHAT amendment omits approved paths:$MISSING — amend every path before transitioning"
+        ;;
+    esac
   else
     check "scope-change-complete" 0
   fi
 
-  if [ -z "$BASE_SHA" ] || [ -z "$BASE_BRANCH" ]; then
-    check "diff-scope" 1 "summary.md Git State must record Base branch and Base SHA"
+  if [ -z "$BASE_SHA" ] || [ -z "$BASE_REF" ]; then
+    check "diff-scope" 1 "summary.md Git State must record Base branch (or Base ref) and Base SHA"
   else
     if ! git merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null; then
       check "diff-scope" 1 "Base SHA $BASE_SHA is not an ancestor of HEAD — wrong base or rebased branch"
+    elif ! git rev-parse --verify --quiet "$BASE_REF" >/dev/null; then
+      check "diff-scope" 1 "Base ref '$BASE_REF' not found in this repo — fetch the integration remote or fix Git State"
     else
       DIFF_FILES=$(git diff --name-only "$BASE_SHA"...HEAD 2>/dev/null || true)
       SCOPE=$(plan_scope_paths)

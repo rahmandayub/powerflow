@@ -98,8 +98,9 @@ User decisions: <verbatim, with date — e.g. "2026-07-05: chose approach B (rea
 Next: <next phase>
 
 ## Git State (mandatory from Executing onward)
-- Base branch: <name, e.g. main>
-- Base SHA: <40-char SHA of base at isolation>
+- Base branch: <short name, e.g. main>
+- Base ref: <exact ref from isolate time, e.g. main or upstream/main>
+- Base SHA: <merge-base of Base ref and HEAD at isolation>
 - Task branch: <powerflow/<slug> or existing branch>
 - Isolation: created|reused|detached — <YYYY-MM-DD>
 ```
@@ -108,8 +109,10 @@ Next: <next phase>
 - If a decision later changes, append a new line; never edit the old one.
 - Git State rule: the branch the session started on is NOT necessarily the base.
   Base is the isolation source recorded by `isolate-branch.sh --porcelain` at isolate
-  time. Executing writes all four fields; Finishing READS them, never re-derives;
-  `validate-transition.sh` uses Base branch/SHA as source of truth.
+  time. Executing writes all five fields (Base ref is the exact ref — critical when
+  remotes share branch names); Finishing READS them, never re-derives;
+  `validate-transition.sh` and `squash-branch.sh` prefer Base ref over Base branch
+  (Base branch stays for human readability and older summaries).
 
 ---
 

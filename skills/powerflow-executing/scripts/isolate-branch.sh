@@ -68,7 +68,10 @@ fi
 # <remote>/<branch> form when the base comes from an upstream or exists only
 # as a remote-tracking ref, so BASE_SHA is always computed from the exact ref
 # chosen (critical with multiple remotes whose branches share a name).
-# --porcelain still emits the short BASE_BRANCH for summary.md compat.
+# --porcelain emits the short BASE_BRANCH (summary.md "Base branch", kept for
+# compat) plus the exact BASE_REF (summary.md "Base ref", e.g. upstream/main).
+# Downstream tools (squash, Finishing) must prefer Base ref: the short name
+# alone is ambiguous when remotes share branch names.
 if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
   INTEGRATION_BASE="$BASE_BRANCH_OVERRIDE"
   BASE_REF="$BASE_BRANCH_OVERRIDE"
@@ -183,6 +186,7 @@ fi
 
 if [ "$PORCELAIN_OUT" = true ]; then
   echo "BASE_BRANCH=$INTEGRATION_BASE"
+  echo "BASE_REF=$BASE_REF"
   echo "BASE_SHA=$BASE_SHA"
   echo "TASK_BRANCH=$TASK_BRANCH"
   echo "ACTION=$ACTION"

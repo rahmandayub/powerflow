@@ -73,14 +73,15 @@ to the user. Do not proceed to integration until resolved.
 
 ## 3. Environment & Base Branch Detection
 
-1. Read the base from `<task-dir>/summary.md` Git State (`Base branch`, `Base SHA`).
-   Verify with:
+1. Read the base from `<task-dir>/summary.md` Git State (`Base ref` preferred,
+   `Base branch` fallback, `Base SHA`). Verify with:
    ```bash
-   git show-ref --verify --quiet "refs/heads/<Base branch>"
+   git rev-parse --verify --quiet "<Base ref>"
    git merge-base --is-ancestor <Base-SHA> HEAD
    ```
    If Git State is missing or verification fails: STOP and ask the user. Never fall
-   back to guessing `main`/`master`.
+   back to guessing `main`/`master`. Checkout and merge target the Base ref
+   (e.g. `upstream/main`), not the short branch name, when they differ.
 2. Detect detached HEAD:
    ```bash
    git rev-parse --abbrev-ref HEAD   # prints HEAD when detached
@@ -149,7 +150,7 @@ Which option?
   - If working on a `powerflow/<slug>` branch:
     1. Run the Preflight (Section 4).
     2. Ensure changes are committed.
-    3. Checkout `<Base branch>` (from `summary.md` Git State — never re-derived).
+    3. Checkout `<Base ref>` (from `summary.md` Git State — never re-derived).
     4. Pull latest (or record "offline, skipped pull").
     5. Merge: `git merge --ff-only powerflow/<task-slug> || git merge powerflow/<task-slug>`.
        For complex merges, spawn an **Integrator** subagent instead — it executes the
@@ -172,7 +173,7 @@ Which option?
     > "This will permanently delete branch <name> and all changes. Type 'discard' to confirm."
   - Once confirmed:
     1. Run the Preflight (Section 4) and save the recovery SHA.
-    2. Checkout the base branch (`git checkout <Base branch from Git State>`).
+    2. Checkout the base (`git checkout <Base ref from Git State>`).
     3. Delete the feature branch (`git branch -D <feature-branch>`).
     4. Remove the worktree (Section 7) if applicable.
 
