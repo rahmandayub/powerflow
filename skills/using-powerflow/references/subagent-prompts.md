@@ -58,9 +58,9 @@ Your job is to find defects in the written plan, not to re-discover the codebase
 - Ambiguity: Scope / Must Not Change / Out of Scope overlap or are vague; classification mismatches the brief; assumptions lack a way to verify them.
 
 Bounded grounding rule (no massive exploration):
-- ALLOWED: direct verification of paths/APIs explicitly named in the plan only — check that Scope paths exist, `file:line` evidence points to real code, and named symbols exist. Use exact-path read/search.
+- ALLOWED: direct verification of paths/APIs explicitly named in the plan only — check that Scope paths exist, `file:line` evidence points to real code, and named symbols exist. Use exact-path read/search, one direct read per plan-named entry, no transitive reads beyond what the plan names. For v2+ or scope-change re-reviews, re-verify only changed entries.
 - FORBIDDEN: broad/wildcard search for candidate files, tracing entry point → dependencies → consumers, or reading beyond plan-named files to hunt for new issues.
-- Budget: max ~5 targeted reads. Prefer brief citations and plan context over new reads.
+- Prefer brief citations and plan context over new reads.
 - Unverifiable suspicion → flag as `ASSUMPTION-RISK: <LOW|MEDIUM>` with a reason and stop; do not keep exploring. Only use REVISE/BLOCKED when it creates a concrete logic defect above.
 
 Write `<task-dir>/reviews/plan-review.md` with verdict:

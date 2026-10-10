@@ -41,7 +41,7 @@ Present the plan's scope, files to modify, out-of-scope files, and acceptance cr
 
 ## 4. Plan Review Loop (Big)
 
-Spawn a subagent using the **Plan Reviewer** prompt from [subagent-prompts.md](../using-powerflow/references/subagent-prompts.md). It writes `<task-dir>/reviews/plan-review.md`. The reviewer uses bounded grounding (verify only paths/APIs explicitly named in the plan, max ~5 targeted reads, no broad exploration); v2+ rounds review only the diff plus unresolved findings.
+Spawn a subagent using the **Plan Reviewer** prompt from [subagent-prompts.md](../using-powerflow/references/subagent-prompts.md). It writes `<task-dir>/reviews/plan-review.md`. The reviewer uses bounded grounding (verify only paths/APIs explicitly named in the plan, one direct read per entry, no broad exploration or transitive reads); v2+ rounds review only the diff plus unresolved findings.
 
 - **APPROVED** → proceed to Final Plan Lock.
 - **REVISE AND RESUBMIT** → revise the plan (v2, v3…), re-run the Plan Reviewer.
