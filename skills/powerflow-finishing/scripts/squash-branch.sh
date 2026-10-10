@@ -62,11 +62,15 @@ if [ -z "$BASE_BRANCH" ]; then
   exit 1
 fi
 
-# Verify the base ref exists locally or on origin.
+# Verify the base ref exists locally or on origin, and keep the ref that
+# actually exists for merge-base below (a remote-only base must be addressed
+# as origin/<branch>, not as a missing local name).
+BASE_REF="$BASE_BRANCH"
 if git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
   :
 elif git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
   echo "Note: using remote-tracking base origin/$BASE_BRANCH" >&2
+  BASE_REF="origin/$BASE_BRANCH"
 else
   echo "Error: base branch '$BASE_BRANCH' not found (no refs/heads/$BASE_BRANCH or refs/remotes/origin/$BASE_BRANCH)" >&2
   exit 1
@@ -102,18 +106,18 @@ elif [ -n "$UNTRACKED" ]; then
   printf '%s\n' "$UNTRACKED" >&2
 fi
 
-BASE_COMMIT=$(git merge-base HEAD "$BASE_BRANCH" 2>/dev/null) || {
-  echo "Error: no merge base with $BASE_BRANCH (pass --base-branch <branch>)" >&2
+BASE_COMMIT=$(git merge-base HEAD "$BASE_REF" 2>/dev/null) || {
+  echo "Error: no merge base with $BASE_REF (pass --base-branch <branch>)" >&2
   exit 1
 }
 
 COMMIT_COUNT=$(git rev-list --count "$BASE_COMMIT"..HEAD)
 if [ "$COMMIT_COUNT" -eq 0 ]; then
-  echo "No commits found between $BASE_BRANCH ($BASE_COMMIT) and HEAD. Nothing to squash."
+  echo "No commits found between $BASE_REF ($BASE_COMMIT) and HEAD. Nothing to squash."
   exit 0
 fi
 
-echo "Found $COMMIT_COUNT commit(s) since $BASE_BRANCH"
+echo "Found $COMMIT_COUNT commit(s) since $BASE_REF"
 
 PRE_SQUASH_HEAD=$(git rev-parse HEAD)
 echo "Pre-squash HEAD: $PRE_SQUASH_HEAD" >&2

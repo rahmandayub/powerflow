@@ -120,4 +120,17 @@ printf '# Powerflow Summary\n\n## Git State\n- Base branch: main\n- Base SHA: x\
 assert_exit "squash-task-dir" 0 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
+# 10. Remote-tracking-only base: local branch deleted, origin/main used
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" checkout -qb "powerflow/rt"
+commit_file "$TMP" a.txt "1" "TASK-001: one"
+# Simulate a clone where the base exists only as origin/main:
+git -C "$TMP" update-ref refs/remotes/origin/main refs/heads/main
+git -C "$TMP" branch -D main
+(cd "$TMP" && bash "$SQUASH" --message "x" --base-branch main >/dev/null 2>&1); CODE=$?
+assert_exit "squash-remote-base" 0 "$CODE"
+COUNT=$(git -C "$TMP" rev-list --count "$(git -C "$TMP" merge-base HEAD origin/main)"..HEAD)
+[ "$COUNT" -eq 1 ] && pass "squash-remote-count" || fail "squash-remote-count" "count=$COUNT"
+rm -rf "$TMP"; trap - EXIT
+
 summary_of

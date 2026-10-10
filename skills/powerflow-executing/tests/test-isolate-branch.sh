@@ -19,16 +19,47 @@ PORC_SHA=$(printf '%s' "$OUT" | grep '^BASE_SHA=' | cut -d= -f2)
 [ "$PORC_SHA" = "$BASE_SHA_BEFORE" ] && pass "isolate-porcelain-sha" || fail "isolate-porcelain-sha" "BASE_SHA=$PORC_SHA expected $BASE_SHA_BEFORE"
 rm -rf "$TMP"; trap - EXIT
 
-# 2. On feature branch -> reused, no checkout
+# 2. On feature branch -> reused; BASE_BRANCH resolves to repo default (main),
+#    NOT the feature branch; BASE_SHA is the merge-base (fork point).
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 git -C "$TMP" checkout -qb my-feature
 OUT=$(cd "$TMP" && bash "$ISOLATE" --task-slug feat2 --porcelain 2>/dev/null); CODE=$?
 assert_exit "isolate-reuse-exit" 0 "$CODE"
 assert_contains "isolate-reuse-branch" "$(git -C "$TMP" rev-parse --abbrev-ref HEAD)" "^my-feature$"
 assert_contains "isolate-reuse-action" "$OUT" "^ACTION=reused$"
+assert_contains "isolate-reuse-base" "$OUT" "^BASE_BRANCH=main$"
+assert_contains "isolate-reuse-task" "$OUT" "^TASK_BRANCH=my-feature$"
 rm -rf "$TMP"; trap - EXIT
 
-# 3a. --base-branch match -> ok; 3b. mismatch -> exit 1
+# 2b. Feature branch with extra commits: BASE_SHA is the fork point, not HEAD.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+FORK_SHA=$(git -C "$TMP" rev-parse HEAD)
+git -C "$TMP" checkout -qb feature/customer-search
+commit_file "$TMP" c.txt "1" "feat: search wip"
+OUT=$(cd "$TMP" && bash "$ISOLATE" --task-slug feat2b --porcelain 2>/dev/null); CODE=$?
+assert_exit "isolate-fork-exit" 0 "$CODE"
+PORC_SHA=$(printf '%s' "$OUT" | grep '^BASE_SHA=' | cut -d= -f2)
+[ "$PORC_SHA" = "$FORK_SHA" ] && pass "isolate-fork-sha" || fail "isolate-fork-sha" "BASE_SHA=$PORC_SHA expected fork $FORK_SHA"
+assert_contains "isolate-fork-base" "$OUT" "^BASE_BRANCH=main$"
+rm -rf "$TMP"; trap - EXIT
+
+# 2c. Explicit --base-branch differing from current branch is allowed.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" checkout -qb my-feature
+OUT=$(cd "$TMP" && bash "$ISOLATE" --task-slug feat2c --base-branch main --porcelain 2>/dev/null); CODE=$?
+assert_exit "isolate-explicit-base-exit" 0 "$CODE"
+assert_contains "isolate-explicit-base" "$OUT" "^BASE_BRANCH=main$"
+assert_contains "isolate-explicit-task" "$OUT" "^TASK_BRANCH=powerflow/feat2c$"
+assert_contains "isolate-explicit-branch" "$(git -C "$TMP" rev-parse --abbrev-ref HEAD)" "^powerflow/feat2c$"
+rm -rf "$TMP"; trap - EXIT
+
+# 2d. Unknown --base-branch -> exit 1.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+(cd "$TMP" && bash "$ISOLATE" --task-slug feat2d --base-branch nope >/dev/null 2>&1); CODE=$?
+assert_exit "isolate-unknown-base" 1 "$CODE"
+rm -rf "$TMP"; trap - EXIT
+
+# 3a. --base-branch match -> ok; 3b. unknown base -> exit 1
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 (cd "$TMP" && bash "$ISOLATE" --task-slug f3 --base-branch main >/dev/null 2>&1); CODE=$?
 assert_exit "isolate-override-match" 0 "$CODE"

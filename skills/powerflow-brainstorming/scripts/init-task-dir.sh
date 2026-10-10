@@ -21,6 +21,19 @@ if [ -z "$TASK_SLUG" ]; then
   exit 1
 fi
 
+# Strict slug validation: reject path separators, traversal, whitespace, and
+# shell-hostile characters before touching the filesystem.
+if [[ "$TASK_SLUG" == *"/"* ]] || [[ "$TASK_SLUG" == *\\* ]] \
+  || [[ "$TASK_SLUG" == *".."* ]] || [[ "$TASK_SLUG" =~ [[:space:]] ]] \
+  || [[ "$TASK_SLUG" =~ [\'\"\;\|\&\$\`\(\)\!\*\?\<\>] ]]; then
+  echo "Error: invalid --task-slug '$TASK_SLUG' (no /, \\\\, .., whitespace, or shell metacharacters)" >&2
+  exit 1
+fi
+if [[ "$TASK_SLUG" == -* ]] || [[ "$TASK_SLUG" == .* ]]; then
+  echo "Error: invalid --task-slug '$TASK_SLUG' (must not start with - or .)" >&2
+  exit 1
+fi
+
 if ! [[ "$TASK_SLUG" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-.+ ]]; then
   TASK_SLUG="$(date +%F)-${TASK_SLUG}"
   echo "Date prefix auto-added: $TASK_SLUG" >&2

@@ -15,20 +15,26 @@ description: Load when an approved plan exists. Implements Small tasks directly 
 ## 1. Branch Isolation
 
 1. Run with porcelain output to capture the Git State:
-   `bash <skills-root>/powerflow-executing/scripts/isolate-branch.sh --task-slug <task-slug> [--base-branch <known-base>] --porcelain`
+   `bash <skills-root>/powerflow-executing/scripts/isolate-branch.sh --task-slug <task-slug> [--base-branch <integration-target>] --porcelain`
+   - `--base-branch` names the INTEGRATION target (the branch work merges back
+     into, e.g. `main`) and may differ from the current branch. Omit it to
+     resolve from the current branch's upstream, else the repo default
+     (`origin/HEAD`, `main`, `master`); if none resolves, the script fails and
+     you must pass it explicitly.
    - Exit 0 → proceed.
    - Exit 1 → error: report it and stop.
    - Exit 2 → detached HEAD: warn the user and use the detached-HEAD finishing menu; do not create a branch.
    - Exit 4 → dirty tree: STOP, ask the user to commit/stash or re-run with `--allow-dirty`.
 2. Write all four Git State fields to `summary.md` from the `--porcelain` output
-   (`BASE_BRANCH` → Base branch, `BASE_SHA` → Base SHA, `TASK_BRANCH` → Task branch,
+   (`BASE_BRANCH` → Base branch = integration target, `BASE_SHA` → Base SHA =
+   merge-base of target and HEAD at isolate time, `TASK_BRANCH` → Task branch,
    plus `Isolation: <ACTION> — <date>`). The branch the session started on is NOT
    necessarily the base — record them as separate fields; Finishing needs the base.
 
 ## 2. Implement
 
 - **Small**: implement directly. Write tests for non-trivial logic (or run concrete verification commands for non-testable code/config/scripts), verify, and commit.
-  - **Mid-Flight Escalation**: if during execution the scope unexpectedly expands (>2 files, new abstractions, schema migrations, cross-cutting dependencies) or risk rises (auth/payment/migration touched, blast radius grows, reversibility drops, regression risk revised up), STOP direct editing immediately, update classification to `Big` in `summary.md` (noting which axis changed), and transition to [powerflow-planning](../powerflow-planning/SKILL.md).
+  - **Mid-Flight Escalation**: if during execution the scope unexpectedly expands (>2 files, new abstractions, schema migrations, cross-cutting dependencies) or risk rises (auth/payment/migration touched, blast radius grows, reversibility drops, regression risk revised up), STOP direct editing immediately, update classification to `Big` in `summary.md` (noting which axis changed — `validate-transition.sh` reads this line as the current classification), and transition to [powerflow-planning](../powerflow-planning/SKILL.md).
   - After the last edit, run the **one-line scope check**: list the files changed and confirm each is in the contract's Scope. No subagent reviews.
 - **Big**: spawn a subagent using the **Implementer** prompt from [subagent-prompts.md](../using-powerflow/references/subagent-prompts.md). It executes steps task-by-task (failing test / concrete verification step → minimal implementation → test passes → atomic commit `TASK-XXX: ...`), appends to `<task-dir>/executions/execution-log.md`, and stops on failure.
 

@@ -59,4 +59,13 @@ TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 assert_exit "init-missing-slug" 1 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
+# 6. Path traversal / separator / hostile slugs rejected (exit 1), nothing created
+for BAD in "../evil" "a/b" ".." "a b" "a;b" "a|b" "a&b" 'a$b' 'a`b`' "-lead" ".lead"; do
+  TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+  (cd "$TMP" && bash "$INIT" --task-slug "$BAD" >/dev/null 2>&1); CODE=$?
+  assert_exit "init-reject-$BAD" 1 "$CODE"
+  [ -d "$TMP/.powerflow" ] && fail "init-reject-$BAD-nodir" ".powerflow/ was created for bad slug" || pass "init-reject-$BAD-nodir"
+  rm -rf "$TMP"; trap - EXIT
+done
+
 summary_of

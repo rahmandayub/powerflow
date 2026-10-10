@@ -10,7 +10,12 @@ description: Load when implementation is complete and verified. Offers commit sq
 - Read `<task-dir>/summary.md` — it records the Git State (Base branch/SHA, task branch) and phase state.
 - Run the transition gate before anything else:
   `bash <skills-root>/using-powerflow/scripts/validate-transition.sh --task-dir <task-dir> --from executing --to finishing`
-  On FAIL: STOP and fix (re-review, re-test at current HEAD, or file a scope-change) — do not squash, merge, or delete.
+  On FAIL: STOP and fix (re-review, scope-change completion, or git state) — do not squash, merge, or delete.
+  This gate intentionally does NOT require the pre-integration test log (it is
+  written in Section 2, after the gate). Before any destructive op (merge,
+  discard, worktree removal), run the preflight instead:
+  `bash <skills-root>/using-powerflow/scripts/validate-transition.sh --task-dir <task-dir> --preflight`
+  On FAIL: STOP and run the missing tiers at current HEAD first.
 - Announce: `"I'm using the powerflow-finishing skill to integrate this work."`
 
 ## 1. Git History Review & Squash Offer (required first)
@@ -44,8 +49,11 @@ Run tiers in order on the current branch; STOP on the first red tier:
 - **Big**: spawn a subagent using the **Test Runner** prompt from [subagent-prompts.md](../using-powerflow/references/subagent-prompts.md).
 
 Policy: always run Tier 1+2; Tier 3 is required before Option 1 (merge) or Option 2
-(PR). A Low-complexity/Low-risk task may record a user waiver for Tier 3 on the
-pre-merge result only — never skip Tier 1+2.
+(PR). A Small task may record a user waiver for Tier 3 in
+`<task-dir>/reports/tier3-waiver.md` (user decision verbatim + date + reason) —
+never skip Tier 1+2, and Big tasks cannot waive Tier 3. The `--preflight` mode
+of `validate-transition.sh` enforces exactly this (Tier 1+2 PASS at HEAD, plus
+Tier 3 PASS at HEAD or a valid waiver).
 
 Log every tier to `<task-dir>/executions/pre-integration-test-run.log` with a
 validator-parseable header per tier:
@@ -84,14 +92,24 @@ to the user. Do not proceed to integration until resolved.
 
 ## 4. Preflight (before any destructive op)
 
-Before merge (Option 1), discard (Option 4), or worktree removal (Section 7):
+Before merge (Option 1), discard (Option 4), or worktree removal (Section 7),
+run the preflight gate (it replaces the manual checklist below):
 
-- Working tree clean for tracked files (`git status --porcelain`), or a user waiver
-  recorded verbatim in `summary.md`.
-- Not detached, unless using the Detached HEAD menu.
-- `pre-integration-test-run.log` exists with a Tier 3 (or waived-tier) PASS at the
-  tested SHA, and the tested SHA equals current HEAD.
-- Save a recovery line to `summary.md` and `<task-dir>/executions/merge-verification.log`:
+```bash
+bash <skills-root>/using-powerflow/scripts/validate-transition.sh --task-dir <task-dir> --preflight
+```
+
+On FAIL: STOP and fix (run the missing tiers at current HEAD, commit/stash, or
+record a Tier 3 waiver for Small tasks) — do not proceed. The preflight checks:
+
+- Tier 1 (smoke) and Tier 2 (affected) PASS at current HEAD in
+  `pre-integration-test-run.log` (never waivable).
+- Tier 3 (full) PASS at current HEAD, or a dated waiver in
+  `<task-dir>/reports/tier3-waiver.md` (Small tasks only).
+- Working tree clean for tracked files, or a user waiver recorded verbatim in
+  `summary.md`.
+- On a branch (detached HEAD uses the Detached HEAD menu only).
+- Additionally save a recovery line to `summary.md` and `<task-dir>/executions/merge-verification.log`:
   `Pre-integration HEAD: <SHA> on <branch>`.
   Recover with `git branch <task-branch> <SHA>` if the ref is lost.
 
