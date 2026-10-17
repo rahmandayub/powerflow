@@ -16,20 +16,36 @@ set -euo pipefail
 #   TASK_BRANCH — powerflow/<slug> when created, else the current branch.
 #
 # Exit codes: 0 ready | 1 error | 2 detached HEAD | 4 dirty working tree
+#
+# Worktree mode (--worktree-path <path> [--base-sha <sha>]):
+#   Creates an isolated worktree holding powerflow/<slug> instead of switching
+#   the current checkout. The current branch is left untouched, so N tasks can
+#   run in parallel from the same base. Porcelain additionally emits
+#   WORKTREE_PATH=<absolute path>.
+#   - Dirty tree in the current checkout does NOT block: the new worktree is
+#     clean by construction; uncommitted changes stay behind (noted on stderr).
+#   - Detached HEAD does NOT block either: the worktree is created from HEAD
+#     (or --base-sha when given) plus the resolved integration base.
+#   - Re-running with the same slug+path while that worktree already holds the
+#     task branch resumes (ACTION=reused); any other collision is exit 1.
 
 FORCE=false
 BASE_BRANCH_OVERRIDE=""
 ALLOW_DIRTY=false
 PORCELAIN_OUT=false
+WORKTREE_PATH_ARG=""
+BASE_SHA_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --task-slug) TASK_SLUG="$2"; shift 2 ;;
     --base-branch) BASE_BRANCH_OVERRIDE="$2"; shift 2 ;;
+    --base-sha) BASE_SHA_OVERRIDE="$2"; shift 2 ;;
+    --worktree-path) WORKTREE_PATH_ARG="$2"; shift 2 ;;
     --force) FORCE=true; shift ;;
     --allow-dirty) ALLOW_DIRTY=true; shift ;;
     --porcelain) PORCELAIN_OUT=true; shift ;;
-    *) echo "Usage: isolate-branch.sh --task-slug <slug> [--base-branch <branch>] [--force] [--allow-dirty] [--porcelain]" >&2; exit 1 ;;
+    *) echo "Usage: isolate-branch.sh --task-slug <slug> [--base-branch <branch>] [--base-sha <sha>] [--worktree-path <path>] [--force] [--allow-dirty] [--porcelain]" >&2; exit 1 ;;
   esac
 done
 
@@ -38,27 +54,55 @@ if [ -z "${TASK_SLUG:-}" ]; then
   exit 1
 fi
 
+# Slug validation (mirrors init-task-dir.sh): the slug becomes powerflow/<slug>
+# and --worktree-path defaults derive from it, so reject traversal and
+# shell-hostile characters before touching git state.
+if [[ "$TASK_SLUG" == *"/"* ]] || [[ "$TASK_SLUG" == *\\* ]] \
+  || [[ "$TASK_SLUG" == *".."* ]] || [[ "$TASK_SLUG" =~ [[:space:]] ]] \
+  || [[ "$TASK_SLUG" =~ [\'\"\;\|\&\$\`\(\)\!\*\?\<\>] ]]; then
+  echo "Error: invalid --task-slug '$TASK_SLUG' (no /, \\\\, .., whitespace, or shell metacharacters)" >&2
+  exit 1
+fi
+if [[ "$TASK_SLUG" == -* ]] || [[ "$TASK_SLUG" == .* ]]; then
+  echo "Error: invalid --task-slug '$TASK_SLUG' (must not start with - or .)" >&2
+  exit 1
+fi
+
+if [ -n "$WORKTREE_PATH_ARG" ] && [ -n "$BASE_SHA_OVERRIDE" ]; then
+  if ! git cat-file -e "${BASE_SHA_OVERRIDE}^{commit}" 2>/dev/null; then
+    echo "Error: --base-sha '$BASE_SHA_OVERRIDE' is not an existing commit" >&2
+    exit 1
+  fi
+fi
+
+WORKTREE_MODE=false
+if [ -n "$WORKTREE_PATH_ARG" ]; then
+  WORKTREE_MODE=true
+fi
+
 CURRENT=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || {
   echo "Error: Not in a git repository" >&2
   exit 1
 }
 
-if [ -z "$CURRENT" ] || [ "$CURRENT" = "HEAD" ]; then
-  echo "WARNING: Detached HEAD at $(git rev-parse --short HEAD)" >&2
-  exit 2
-fi
+if [ "$WORKTREE_MODE" = false ]; then
+  if [ -z "$CURRENT" ] || [ "$CURRENT" = "HEAD" ]; then
+    echo "WARNING: Detached HEAD at $(git rev-parse --short HEAD)" >&2
+    exit 2
+  fi
 
-# Dirty-tree guard: tracked staged/unstaged changes block branch creation.
-PORCELAIN=$(git status --porcelain)
-TRACKED_DIRTY=$(printf '%s\n' "$PORCELAIN" | grep -v '^??' | grep -v '^ *$' || true)
-if [ -n "$TRACKED_DIRTY" ]; then
-  if [ "$ALLOW_DIRTY" = true ]; then
-    echo "WARNING: proceeding with dirty tree (--allow-dirty)." >&2
-  else
-    echo "Error: dirty working tree. Commit, stash, or re-run with --allow-dirty." >&2
-    echo "--- git status --short ---" >&2
-    printf '%s\n' "$PORCELAIN" >&2
-    exit 4
+  # Dirty-tree guard: tracked staged/unstaged changes block branch creation.
+  PORCELAIN=$(git status --porcelain)
+  TRACKED_DIRTY=$(printf '%s\n' "$PORCELAIN" | grep -v '^??' | grep -v '^ *$' || true)
+  if [ -n "$TRACKED_DIRTY" ]; then
+    if [ "$ALLOW_DIRTY" = true ]; then
+      echo "WARNING: proceeding with dirty tree (--allow-dirty)." >&2
+    else
+      echo "Error: dirty working tree. Commit, stash, or re-run with --allow-dirty." >&2
+      echo "--- git status --short ---" >&2
+      printf '%s\n' "$PORCELAIN" >&2
+      exit 4
+    fi
   fi
 fi
 
@@ -154,10 +198,113 @@ fi
 # (On a fresh base branch this equals HEAD; on an existing feature branch it
 # is the fork point — never HEAD itself, so the diff-scope check stays sound.)
 # BASE_REF already holds the exact ref resolved above; BASE_SHA comes from it.
-BASE_SHA=$(git merge-base HEAD "$BASE_REF" 2>/dev/null) || {
-  echo "Error: no merge base between HEAD and $BASE_REF — wrong integration base?" >&2
-  exit 1
-}
+# With --base-sha the baseline is explicit (the worktree starts exactly there).
+if [ -n "$BASE_SHA_OVERRIDE" ]; then
+  BASE_SHA="$BASE_SHA_OVERRIDE"
+else
+  BASE_SHA=$(git merge-base HEAD "$BASE_REF" 2>/dev/null) || {
+    echo "Error: no merge base between HEAD and $BASE_REF — wrong integration base?" >&2
+    exit 1
+  }
+fi
+
+# --- worktree mode: isolated checkout per task, current branch untouched ------
+if [ "$WORKTREE_MODE" = true ]; then
+  POWERFLOW_BRANCH="powerflow/$TASK_SLUG"
+
+  # Main repo root = first worktree listed (stable in main checkout and in any
+  # linked worktree, unlike --show-toplevel which returns the current wt).
+  MAIN_ROOT=$(git worktree list --porcelain | awk '/^worktree /{print substr($0, 10); exit}')
+  if [ -z "$MAIN_ROOT" ]; then
+    MAIN_ROOT=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/..
+    MAIN_ROOT=$(cd "$MAIN_ROOT" 2>/dev/null && pwd -P) || {
+      echo "Error: cannot resolve repository root for worktree placement" >&2
+      exit 1
+    }
+  fi
+
+  # Resolve the worktree path: .worktrees/<x> and worktrees/<x> are relative to
+  # the main root (so every parallel agent agrees); anything else is relative
+  # to the caller's cwd. realpath -m canonicalises without requiring existence.
+  case "$WORKTREE_PATH_ARG" in
+    /*) ABS_WT=$(realpath -m "$WORKTREE_PATH_ARG") ;;
+    .worktrees/*|worktrees/*|./.worktrees/*|./worktrees/*)
+      CLEAN=${WORKTREE_PATH_ARG#./}
+      ABS_WT=$(realpath -m "$MAIN_ROOT/$CLEAN") ;;
+    *) ABS_WT=$(realpath -m "$PWD/$WORKTREE_PATH_ARG") ;;
+  esac
+
+  # Safety: never take the repo root itself, .git internals, or task state.
+  if [ "$ABS_WT" = "$MAIN_ROOT" ]; then
+    echo "Error: worktree path must not be the repository root" >&2
+    exit 1
+  fi
+  case "$ABS_WT" in
+    "$MAIN_ROOT/.git"|"$MAIN_ROOT/.git/"*) echo "Error: worktree path must not be inside .git" >&2; exit 1 ;;
+    "$MAIN_ROOT/.powerflow"|"$MAIN_ROOT/.powerflow/"*) echo "Error: worktree path must not be inside .powerflow/" >&2; exit 1 ;;
+  esac
+
+  # Resume: same path already registered AND already on the task branch.
+  if git worktree list --porcelain | grep -qx "worktree $ABS_WT"; then
+    WT_BRANCH=$(git -C "$ABS_WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "UNKNOWN")
+    if [ "$WT_BRANCH" = "$POWERFLOW_BRANCH" ]; then
+      echo "Reusing worktree $ABS_WT on $POWERFLOW_BRANCH (resume)." >&2
+      TASK_BRANCH="$POWERFLOW_BRANCH"
+      ACTION="reused"
+      if [ "$PORCELAIN_OUT" = true ]; then
+        echo "BASE_BRANCH=$INTEGRATION_BASE"
+        echo "BASE_REF=$BASE_REF"
+        echo "BASE_SHA=$BASE_SHA"
+        echo "TASK_BRANCH=$TASK_BRANCH"
+        echo "ACTION=$ACTION"
+        echo "WORKTREE_PATH=$ABS_WT"
+      fi
+      exit 0
+    fi
+    echo "Error: worktree path $ABS_WT already registered for another branch ($WT_BRANCH)" >&2
+    exit 1
+  fi
+  if [ -e "$ABS_WT" ]; then
+    echo "Error: worktree path $ABS_WT already exists on disk" >&2
+    exit 1
+  fi
+  if git show-ref --verify --quiet "refs/heads/$POWERFLOW_BRANCH"; then
+    echo "Error: Branch $POWERFLOW_BRANCH already exists" >&2
+    exit 1
+  fi
+
+  # Start point mirrors branch mode (HEAD) unless --base-sha pins it.
+  # Uncommitted changes in the current checkout stay behind by design.
+  if [ -n "$BASE_SHA_OVERRIDE" ]; then
+    START_POINT="$BASE_SHA_OVERRIDE"
+  else
+    START_POINT=$(git rev-parse HEAD) || {
+      echo "Error: cannot resolve HEAD as worktree start point" >&2
+      exit 1
+    }
+    PORCELAIN_DIRTY=$(git status --porcelain 2>/dev/null | grep -v '^??' | grep -v '^ *$' || true)
+    if [ -n "$PORCELAIN_DIRTY" ]; then
+      echo "Note: dirty tree in current checkout stays behind; new worktree starts clean at ${START_POINT:0:7}." >&2
+    fi
+  fi
+
+  if ! git worktree add -b "$POWERFLOW_BRANCH" "$ABS_WT" "$START_POINT" >&2; then
+    echo "Error: failed to create worktree at $ABS_WT" >&2
+    exit 1
+  fi
+  echo "Created worktree $ABS_WT on $POWERFLOW_BRANCH from ${START_POINT:0:7} (base $INTEGRATION_BASE @ ${BASE_SHA:0:7})" >&2
+  TASK_BRANCH="$POWERFLOW_BRANCH"
+  ACTION="created"
+  if [ "$PORCELAIN_OUT" = true ]; then
+    echo "BASE_BRANCH=$INTEGRATION_BASE"
+    echo "BASE_REF=$BASE_REF"
+    echo "BASE_SHA=$BASE_SHA"
+    echo "TASK_BRANCH=$TASK_BRANCH"
+    echo "ACTION=$ACTION"
+    echo "WORKTREE_PATH=$ABS_WT"
+  fi
+  exit 0
+fi
 
 if [ "$SHOULD_ISOLATE" = true ]; then
   POWERFLOW_BRANCH="powerflow/$TASK_SLUG"

@@ -17,8 +17,10 @@ Skills are installed as siblings under a common skills root:
 
 ```
 skills/
-├── using-powerflow/
+├── using-powerflow/         # SKILL.md + scripts/list-tasks.sh
 │   ├── SKILL.md
+│   ├── scripts/
+│   │   └── list-tasks.sh          # derived multi-task registry (Tahap 2)
 │   └── references/
 │       ├── complexity-rubric.md     # Small/Big classification
 │       ├── global-epistemology.md   # FACT / ASSUMPTION evidence rule
@@ -28,7 +30,7 @@ skills/
 ├── powerflow-planning/        # SKILL.md only
 ├── powerflow-debugging/       # SKILL.md only
 ├── powerflow-executing/       # SKILL.md + scripts/isolate-branch.sh
-└── powerflow-finishing/       # SKILL.md + scripts/squash-branch.sh
+└── powerflow-finishing/       # SKILL.md + scripts/squash-branch.sh, integrate-task.sh, integration-lock.sh
 ```
 
 Cross-skill paths (e.g. `using-powerflow/references/complexity-rubric.md`) resolve relative to the skills root.
@@ -101,19 +103,66 @@ Next: <next phase>
 ## Git State (mandatory from Executing onward)
 - Base branch: <short name, e.g. main>
 - Base ref: <exact ref from isolate time, e.g. main or upstream/main>
-- Base SHA: <merge-base of Base ref and HEAD at isolation>
+- Base SHA: <merge-base of Base ref and HEAD at isolation, or explicit --base-sha>
 - Task branch: <powerflow/<slug> or existing branch>
 - Isolation: created|reused|detached — <YYYY-MM-DD>
+- Worktree path: <absolute path when isolate used --worktree-path; omit for in-place branch mode>
 ```
 
 - Record user decisions verbatim with the date. Settled decisions are not reopened.
 - If a decision later changes, append a new line; never edit the old one.
 - Git State rule: the branch the session started on is NOT necessarily the base.
   Base is the isolation source recorded by `isolate-branch.sh --porcelain` at isolate
-  time. Executing writes all five fields (Base ref is the exact ref — critical when
+  time. Executing writes all fields (Base ref is the exact ref — critical when
   remotes share branch names); Finishing READS them, never re-derives;
   `validate-transition.sh` and `squash-branch.sh` prefer Base ref over Base branch
   (Base branch stays for human readability and older summaries).
+  Worktree rule: when isolation used `--worktree-path`, record its porcelain
+  `WORKTREE_PATH` verbatim. All later phases run `git -C <worktree-path>` and
+  treat that path as the task checkout; the main checkout is never switched.
+  Re-running isolate with the same slug+path resumes (`ACTION=reused`).
+
+---
+
+## Multi-Task Registry & Dependencies
+
+Independent tasks may run in parallel (one worktree each); quality gates stay
+sequential per task. The registry is DERIVED, never stored: there is still no
+`state.json`. Query it any time with:
+
+```bash
+bash <skills-root>/using-powerflow/scripts/list-tasks.sh [--porcelain] [--max-parallel N]
+bash <skills-root>/using-powerflow/scripts/list-tasks.sh --check-ready <task-slug> [--porcelain] [--max-parallel N]
+```
+
+- The scan always targets the MAIN checkout's `.powerflow/` (task state is
+  gitignored and lives only there) — safe to run from inside any task worktree.
+- Each task is reconciled against live git state: `WT_STATUS`
+  (`active|missing|in-place`), `BRANCH_STATUS` (`exists|missing|none`), and
+  advisory `BASE_STATUS` (`current|stale|...`, feeds the Tahap 3 queue). Never
+  trust the summary alone: a task is only truly active while its worktree or
+  branch exists.
+- **Dependencies**: Planning records one line in `summary.md` (slugs are
+  `.powerflow/` dir basenames, date prefix included):
+  `- Depends on: <slug-a>, <slug-b>` — or omit the line / write `None` for
+  independent tasks. A dependency counts as complete when its summary reaches
+  `## Phase: Finishing`. Unknown slugs, self-dependencies, and tasks without
+  `summary.md` block. Dependency cycles are not auto-resolved — break them by
+  removing one edge.
+- **Dependent-task base**: default is the UPDATED integration base AFTER the
+  dependency merges (re-run isolate then). Only pin `--base-sha` to the
+  dependency's verified SHA for intentionally stacked work.
+- **Concurrency**: default max 2 holding tasks (a holder = live worktree OR
+  existing branch). Override per call with `--max-parallel N` or globally via
+  `POWERFLOW_MAX_PARALLEL`. `--check-ready` exits 0 (ready), 3 (blocked:
+  `deps:...` and/or `slots:full`), 2 (usage/unknown task). A task's own
+  worktree never counts against its own resume check.
+- This gate schedules work only — it never replaces `validate-transition.sh`
+  phase gates. Run those as usual.
+- Queue order hint: integrate tasks with `BASE_STATUS=current` first; `stale`
+  tasks rebase (and re-verify) before queueing, otherwise they refuse at the
+  lock with exit 4. The merge itself always runs under the integration lock
+  via `powerflow-finishing/scripts/integrate-task.sh` (Finishing Section 9).
 
 ---
 

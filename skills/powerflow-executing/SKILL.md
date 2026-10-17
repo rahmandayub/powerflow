@@ -12,10 +12,21 @@ description: Load when an approved plan exists. Implements Small tasks directly 
 - Extract the **Implementation Contract** — it is the highest authority; do not violate it.
 - Announce: `"I'm using the powerflow-executing skill to implement the approved plan."`
 
-## 1. Branch Isolation
+## 1. Branch Isolation (worktree-first for parallel tasks)
 
+0. Scheduling gate (multi-task sessions): run
+   `bash <skills-root>/using-powerflow/scripts/list-tasks.sh --check-ready "$TASK_SLUG"`.
+   Exit 3 → STOP and wait (blocked by `deps:...` or `slots:full`); do not
+   isolate or implement until it exits 0. Single-task sessions may skip this.
 1. Run with porcelain output to capture the Git State:
-   `TASK_SLUG=$(basename <task-dir>); bash <skills-root>/powerflow-executing/scripts/isolate-branch.sh --task-slug "$TASK_SLUG" [--base-branch <integration-target>] --porcelain`
+   `TASK_SLUG=$(basename <task-dir>); bash <skills-root>/powerflow-executing/scripts/isolate-branch.sh --task-slug "$TASK_SLUG" [--base-branch <integration-target>] [--worktree-path .worktrees/"$TASK_SLUG"] [--base-sha <sha>] --porcelain`
+   - Prefer `--worktree-path` whenever another task may run in parallel: it
+     creates `.worktrees/<slug>` holding `powerflow/<slug>` and leaves the
+     current checkout untouched. Omit it only for strictly sequential,
+     single-task sessions (legacy in-place branch mode).
+   - `--base-sha` pins the worktree start point (e.g. a dependent task starting
+     from another task's verified SHA). Omit it to start from current HEAD;
+     `BASE_SHA` then records the merge-base fork point as before.
    - Derive `--task-slug` from the basename of the resolved `<task-dir>` (the stdout of `init-task-dir.sh`), never the original bare slug — after a `-02` collision fallback this is the only way dir and `powerflow/<slug>` branch stay identical.
    - `--base-branch` names the INTEGRATION target (the branch work merges back
      into, e.g. `main`) and may differ from the current branch. Omit it to
@@ -24,12 +35,17 @@ description: Load when an approved plan exists. Implements Small tasks directly 
      you must pass it explicitly.
    - Exit 0 → proceed.
    - Exit 1 → error: report it and stop.
-   - Exit 2 → detached HEAD: warn the user and use the detached-HEAD finishing menu; do not create a branch.
-   - Exit 4 → dirty tree: STOP, ask the user to commit/stash or re-run with `--allow-dirty`.
-2. Write all five Git State fields to `summary.md` from the `--porcelain` output
+   - Exit 2 → detached HEAD (branch mode only): warn the user and use the detached-HEAD finishing menu; do not create a branch. Worktree mode is unaffected by detached HEAD.
+   - Exit 4 → dirty tree (branch mode only): STOP, ask the user to commit/stash or re-run with `--allow-dirty`. Worktree mode starts clean by construction; dirty changes in the calling checkout stay behind and do not block.
+2. Write all Git State fields to `summary.md` from the `--porcelain` output
    (`BASE_BRANCH` → Base branch = short integration name, `BASE_REF` → Base ref =
-   exact ref, `BASE_SHA` → Base SHA = merge-base of ref and HEAD at isolate time,
-   `TASK_BRANCH` → Task branch, plus `Isolation: <ACTION> — <date>`). The branch the session started on is NOT
+   exact ref, `BASE_SHA` → Base SHA = merge-base of ref and HEAD at isolate time
+   (or the explicit `--base-sha`), `TASK_BRANCH` → Task branch, plus
+   `Isolation: <ACTION> — <date>` and, in worktree mode, `Worktree path:` from
+   `WORKTREE_PATH`). Every later command for this task runs in that worktree
+   (`git -C <worktree-path>`, edits and tests with cwd set there). Re-running
+   isolate with the same slug+path resumes the worktree (`ACTION=reused`) after
+   a disconnected session. The branch the session started on is NOT
    necessarily the base — record them as separate fields; Finishing needs the base.
    - `ACTION=created`: fresh `powerflow/<slug>` branch; Base SHA equals HEAD at
      isolate time.

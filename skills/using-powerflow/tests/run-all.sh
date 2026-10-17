@@ -17,9 +17,13 @@ run_suite() {
 
 run_suite "init-task-dir" "$SKILLS_ROOT/powerflow-brainstorming/tests/test-init-task-dir.sh"
 run_suite "isolate-branch" "$SKILLS_ROOT/powerflow-executing/tests/test-isolate-branch.sh"
+run_suite "isolate-worktree" "$SKILLS_ROOT/powerflow-executing/tests/test-isolate-worktree.sh"
+run_suite "list-tasks" "$SKILLS_ROOT/using-powerflow/tests/test-list-tasks.sh"
 run_suite "squash-branch" "$SKILLS_ROOT/powerflow-finishing/tests/test-squash-branch.sh"
 run_suite "resolve-integration-branch" "$SKILLS_ROOT/powerflow-finishing/tests/test-resolve-integration-branch.sh"
 run_suite "worktree-integration" "$SKILLS_ROOT/powerflow-finishing/tests/test-worktree-integration.sh"
+run_suite "integration-lock" "$SKILLS_ROOT/powerflow-finishing/tests/test-integration-lock.sh"
+run_suite "integrate-task" "$SKILLS_ROOT/powerflow-finishing/tests/test-integrate-task.sh"
 run_suite "validate-transition" "$SKILLS_ROOT/using-powerflow/tests/test-validate-transition.sh"
 run_suite "doc-contract" "$SKILLS_ROOT/using-powerflow/tests/test-doc-contract.sh"
 

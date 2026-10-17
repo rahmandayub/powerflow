@@ -35,6 +35,21 @@ Machine-parseable shape (required by `validate-transition.sh`):
 - Assumptions section (each with a way to verify it)
 - Steps: task ID (TASK-001…), description, evidence link (`file:line`), the verification method (failing test for logic/code, or explicit verification command/schema check/lint for config/UI/scripts), which `AC-00X` it covers, the minimal implementation, the verification command, the atomic commit message
 
+### Independence Check (every plan — decides parallel vs blocked)
+
+Before Checkpoint B, list every other active task from
+`bash <skills-root>/using-powerflow/scripts/list-tasks.sh` and classify:
+
+- **Independent**: needs only the shared base branch (different files, no
+  contract overlap) → no dependency; it may isolate and execute in parallel.
+- **Dependent**: needs another task's output, contract, or merged result
+  (e.g. frontend consuming a new endpoint) → record
+  `- Depends on: <other-task-slug>` in `summary.md` (slugs are `.powerflow/`
+  dir basenames). A dependent task MUST NOT isolate until
+  `list-tasks.sh --check-ready <slug>` exits 0; when unblocked, isolate from
+  the updated base (or pin `--base-sha` for stacked work — see
+  `using-powerflow/SKILL.md`).
+
 ## 3. Checkpoint B (Big)
 
 Present the plan's scope, files to modify, out-of-scope files, and acceptance criteria. Ask the user to confirm or adjust. If the user changes the approach: return to [powerflow-brainstorming](../powerflow-brainstorming/SKILL.md) to re-run Checkpoint A. If the approach changes a second time, ask the user what they actually want instead of re-drafting again.

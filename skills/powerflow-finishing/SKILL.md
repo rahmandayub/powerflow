@@ -165,6 +165,11 @@ Which option?
 
 ## 6. Execution of Choice
 
+> Multi-task sessions: prefer the coordinated queue (Section 9,
+> `integrate-task.sh`) over the manual Option 1 below. It enforces the same
+> rules — one merge at a time, verification on the merged result, cleanup only
+> on success — without relying on the orchestrator to serialize by hand.
+
 - **Option 1 (Merge locally)**:
   - If working on a `powerflow/<slug>` branch:
     1. Run the Preflight (Section 4).
@@ -271,3 +276,48 @@ removed the worktree in Section 6):
 ## 8. Closeout
 
 Update `summary.md`: phase done, integration choice & result, task complete.
+
+## 9. Coordinated Integration (Multi-Task Queue)
+
+When several tasks are active, merges into the shared integration branch are
+serialized with `scripts/integrate-task.sh`. Two individually-green tasks are
+never assumed safe combined: every merge is followed by verification ON THE
+MERGED RESULT, and cleanup happens only after that verification passes.
+
+```bash
+bash <skills-root>/powerflow-finishing/scripts/integrate-task.sh \
+  --task-dir <task-dir> \
+  --verify-command "<tier-1 smoke>" [--verify-command "<tier-2 affected>" ...] \
+  [--allow-stale-base] [--offline] [--porcelain]
+```
+
+Rules (enforced by the script, same spirit as Sections 2–7):
+
+1. **One merge at a time.** The script holds `.powerflow/.integration-lock`
+   for the whole run (`integration-lock.sh`: atomic mkdir, age-based stale
+   takeover, always released). A second task gets exit 3 — it waits, it never
+   merges in parallel. Inspect with `integration-lock.sh status`.
+2. **Sync explicitly.** With an upstream it runs `pull --ff-only` and stops
+   (exit 4) on failure; with no upstream it stops unless `--offline` records
+   the conscious decision to skip. Never merges onto an unknown base silently.
+3. **Stale base refuses by default** (exit 4): when the integration branch
+   advanced past the task's Base SHA, rebase the task, re-verify, and re-run —
+   or pass `--allow-stale-base` to merge now. A `BASE_SHA`-diverged task always
+   requires a rebase. `list-tasks.sh` `BASE_STATUS` (`current|stale`) tells you
+   which tasks need attention before queueing.
+4. **Overlap is advisory, verification gates.** Files touched by BOTH the task
+   and the advanced base are reported (`OVERLAP=...`, also logged) as a
+   semantic-conflict hint — textual merge success proves nothing about shared
+   contracts. The `--verify-command` tiers (run in the merge location, in
+   order, first red stops) are the actual gate; run the full suite here, not
+   just the affected tiers.
+5. **Failures keep everything** (exit 4 conflict/stale, exit 5 verify-failed):
+   task branch + worktree stay, the log
+   (`<task-dir>/executions/merge-verification.log`, `COMMAND/SHA/EXIT` per
+   tier) and a recovery ref (`git branch <task-branch> <SHA>`, plus the
+   pre-merge integration SHA for `reset --hard`) are printed. At least one
+   `--verify-command` is mandatory — unverified merges are refused outright.
+6. **Cleanup only on success**: task worktree removed first, then the task
+   branch (`-d`, `-D` when squash made it non-ancestor), then `prune`.
+   After success, record the choice, `MERGE_SHA`, and verification result in
+   `summary.md` (Closeout) and free the slot for the next queued task.
