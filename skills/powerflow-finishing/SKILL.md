@@ -275,7 +275,21 @@ removed the worktree in Section 6):
 
 ## 8. Closeout
 
-Update `summary.md`: phase done, integration choice & result, task complete.
+Update `summary.md`: phase done, integration choice & result, task complete —
+with an explicit machine-readable closeout (dependents unblock ONLY on this;
+`Phase: Finishing` alone never satisfies a dependency):
+
+```markdown
+- Integration: merged|kept|pr|discarded|pending — <YYYY-MM-DD>
+- Merge SHA: <sha>                       # merged only
+- Post-merge verification: passed|failed|waived — <YYYY-MM-DD> (evidence path)
+```
+
+- `merged` + `passed` = the integrated result exists and is verified; this is
+  the only state that unblocks `Depends on` tasks.
+- `kept` (branch preserved for later) and `pr` (pushed, unmerged) keep the
+  branch — and its concurrency slot — but do NOT satisfy dependents waiting
+  for the integrated result.
 
 ## 9. Coordinated Integration (Multi-Task Queue)
 
@@ -294,9 +308,15 @@ bash <skills-root>/powerflow-finishing/scripts/integrate-task.sh \
 Rules (enforced by the script, same spirit as Sections 2–7):
 
 1. **One merge at a time.** The script holds `.powerflow/.integration-lock`
-   for the whole run (`integration-lock.sh`: atomic mkdir, age-based stale
-   takeover, always released). A second task gets exit 3 — it waits, it never
-   merges in parallel. Inspect with `integration-lock.sh status`.
+   for the whole run (`integration-lock.sh`: atomic mkdir, always released).
+   The lock is a heartbeat lease: the integrator refreshes it continuously
+   (every `POWERFLOW_HEARTBEAT_INTERVAL`, default 60s, always well below the
+   steal threshold), so even an integration longer than `--stale-after`
+   (default 1800s) is never mistaken for a crash. Only a lease with NO
+   refresh for the full threshold is stolen — a crashed run stops
+   heartbeating, so the queue still recovers. A second task gets exit 3 — it
+   waits, it never merges in parallel. Inspect with
+   `integration-lock.sh status`.
 2. **Sync explicitly.** With an upstream it runs `pull --ff-only` and stops
    (exit 4) on failure; with no upstream it stops unless `--offline` records
    the conscious decision to skip. Never merges onto an unknown base silently.
@@ -321,3 +341,16 @@ Rules (enforced by the script, same spirit as Sections 2–7):
    branch (`-d`, `-D` when squash made it non-ancestor), then `prune`.
    After success, record the choice, `MERGE_SHA`, and verification result in
    `summary.md` (Closeout) and free the slot for the next queued task.
+7. **Preflight evidence is mandatory.** The script runs
+   `validate-transition.sh --preflight` in the task worktree before merging:
+   Tier 1+2 PASS at the task HEAD, Tier 3 (or a Small-task waiver), clean
+   tree, on the task branch. `--verify-command true` alone proves nothing
+   about pre-merge evidence and is rejected without it (exit 4);
+   `--skip-preflight` bypasses explicitly and is logged.
+8. **Stacked tasks** (started with `--base-sha` on an UNMERGED dependency's
+   commit) integrate in dependency order: after the dependency merges, the
+   stacked task's Base SHA is an ancestor of the integration branch, so it
+   passes the diverged check as *stale* and merges with `--allow-stale-base`
+   (verification still gates). A Base SHA that never enters the integration
+   branch stays *diverged* and is refused — rebase onto the merged result
+   instead. Stacking is supported only through this ordered pattern.

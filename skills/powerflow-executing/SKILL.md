@@ -7,7 +7,7 @@ description: Load when an approved plan exists. Implements Small tasks directly 
 
 ## Before You Start
 
-- Task directory: `.powerflow/YYYY-MM-DD-HHMM-<task-slug>/`. If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (add `--no-gitignore` to skip `.gitignore` mutation; exit 2/3 → ask the user). Announce explicitly if `.gitignore` was created or modified.
+- Task directory: `.powerflow/YYYY-MM-DD-HHMM-<task-slug>/` under the MAIN worktree root (see `using-powerflow` rule 5 — metadata never lives inside a task worktree, even if `init-task-dir.sh` runs there). If it does not exist, create it with `bash <skills-root>/powerflow-brainstorming/scripts/init-task-dir.sh --task-slug <slug>` (add `--no-gitignore` to skip `.gitignore` mutation; exit 2/3 → ask the user). Announce explicitly if `.gitignore` was created or modified.
 - Read `<task-dir>/summary.md` first if it exists, then the approved Final Plan at `<task-dir>/plans/plan-final.md`.
 - Extract the **Implementation Contract** — it is the highest authority; do not violate it.
 - Announce: `"I'm using the powerflow-executing skill to implement the approved plan."`
@@ -24,9 +24,11 @@ description: Load when an approved plan exists. Implements Small tasks directly 
      creates `.worktrees/<slug>` holding `powerflow/<slug>` and leaves the
      current checkout untouched. Omit it only for strictly sequential,
      single-task sessions (legacy in-place branch mode).
-   - `--base-sha` pins the worktree start point (e.g. a dependent task starting
-     from another task's verified SHA). Omit it to start from current HEAD;
-     `BASE_SHA` then records the merge-base fork point as before.
+   - New worktrees start from the resolved integration base tip even when
+     invoked from inside another task's worktree — never from the caller's
+     `HEAD`, so no task inherits another task's commits. `--base-sha` pins an
+     explicit start point for intentional stacked work only (e.g. a dependent
+     task starting from another task's verified SHA).
    - Derive `--task-slug` from the basename of the resolved `<task-dir>` (the stdout of `init-task-dir.sh`), never the original bare slug — after a `-02` collision fallback this is the only way dir and `powerflow/<slug>` branch stay identical.
    - `--base-branch` names the INTEGRATION target (the branch work merges back
      into, e.g. `main`) and may differ from the current branch. Omit it to

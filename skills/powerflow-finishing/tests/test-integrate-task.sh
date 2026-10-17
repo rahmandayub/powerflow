@@ -29,7 +29,22 @@ make_integ_task() {
       | sed -E 's/^BASE_BRANCH=/- Base branch: /; s/^BASE_REF=/- Base ref: /; s/^BASE_SHA=/- Base SHA: /; s/^TASK_BRANCH=/- Task branch: /'
     printf -- '- Isolation: created — 2026-10-17\n- Worktree path: %s\n' "$wt"
   } > "$repo/.powerflow/$slug/summary.md"
+  # Passing preflight evidence at the task HEAD (Tier 1+2+3 PASS), so the
+  # integrate preflight gate is satisfied unless a test removes it.
+  write_preflight_log "$repo" "$slug" "$(git -C "$wt" rev-parse HEAD)"
   echo "$repo $slug $wt"
+}
+
+# Fabricates a passing pre-integration log for <sha> (all three tiers PASS).
+write_preflight_log() { # write_preflight_log <repo> <slug> <sha>
+  local log="$1/.powerflow/$2/executions/pre-integration-test-run.log"
+  mkdir -p "$(dirname "$log")"
+  for tier in smoke affected full; do
+    {
+      printf 'TIER: %s\nCOMMAND: make %s\nSHA: %s\nEXIT: 0\n' "$tier" "$tier" "$3"
+      printf 'ok\n'
+    } >> "$log"
+  done
 }
 
 # 1. Happy path: merge + verify + worktree/branch cleanup, porcelain + log.
@@ -47,6 +62,27 @@ grep -Eq '^COMMAND: true$' "$TMP/.powerflow/$SLUG/executions/merge-verification.
 grep -Eq '^EXIT: 0$' "$TMP/.powerflow/$SLUG/executions/merge-verification.log" && pass "integ-ok-log-exit" || fail "integ-ok-log-exit" "no EXIT block in merge log"
 OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
 assert_contains "integ-ok-lock-free" "$OUT" "^LOCK=free$"
+trap - EXIT; rm -rf "$TMP"
+
+# 1b. Relative --task-dir resolves against the MAIN root even when invoked
+#     from inside the task worktree itself.
+read -r TMP SLUG WT < <(make_integ_task); trap 'rm -rf "$TMP"' EXIT
+(cd "$WT" && bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command true --offline >/dev/null 2>&1); CODE=$?
+assert_exit "integ-wt-cwd-exit" 0 "$CODE"
+[ -f "$TMP/work.txt" ] && pass "integ-wt-cwd-merged" || fail "integ-wt-cwd-merged" "merge missing when run from worktree cwd"
+trap - EXIT; rm -rf "$TMP"
+
+# 1c. Slow integration outlives --stale-after: heartbeat holds the lock, a
+#     rival acquire is refused mid-run, and the merge still completes.
+read -r TMP SLUG WT < <(make_integ_task); trap 'rm -rf "$TMP"' EXIT
+(cd "$TMP" && POWERFLOW_HEARTBEAT_INTERVAL=1 bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command "sleep 5" --offline --stale-after 2 >/dev/null 2>&1) &
+INTPID=$!
+sleep 3
+(cd "$TMP" && bash "$LOCK" acquire --task thief --stale-after 2 >/dev/null 2>&1); CODE=$?
+assert_exit "integ-slow-locked" 3 "$CODE"
+wait "$INTPID"; CODE=$?
+assert_exit "integ-slow-done" 0 "$CODE"
+[ "$(git -C "$TMP" branch --list 'powerflow/*' | wc -l)" -eq 0 ] && pass "integ-slow-cleaned" || fail "integ-slow-cleaned" "slow integration did not finish cleanup"
 trap - EXIT; rm -rf "$TMP"
 
 # 2. Usage guards: no verify command, missing task dir, missing summary.
@@ -94,6 +130,7 @@ mkdir -p "$TMP/.powerflow/2026-10-17-feat"
     | sed -E 's/^BASE_BRANCH=/- Base branch: /; s/^BASE_REF=/- Base ref: /; s/^BASE_SHA=/- Base SHA: /; s/^TASK_BRANCH=/- Task branch: /'
   printf -- '- Isolation: created — 2026-10-17\n- Worktree path: %s\n' "$WT"
 } > "$TMP/.powerflow/2026-10-17-feat/summary.md"
+write_preflight_log "$TMP" "2026-10-17-feat" "$(git -C "$WT" rev-parse HEAD)"
 (cd "$TMP" && bash "$INT" --task-dir .powerflow/2026-10-17-feat --verify-command true --offline --allow-stale-base >/dev/null 2>&1); CODE=$?
 assert_exit "integ-conflict-exit" 4 "$CODE"
 git -C "$TMP" show-ref --verify --quiet refs/heads/powerflow/feat && pass "integ-conflict-branch" || fail "integ-conflict-branch" "task branch lost on conflict"
@@ -126,10 +163,27 @@ mkdir -p "$TMP/.powerflow/2026-10-17-feat"
     | sed -E 's/^BASE_BRANCH=/- Base branch: /; s/^BASE_REF=/- Base ref: /; s/^BASE_SHA=/- Base SHA: /; s/^TASK_BRANCH=/- Task branch: /'
   printf -- '- Isolation: created — 2026-10-17\n- Worktree path: %s\n' "$WT"
 } > "$TMP/.powerflow/2026-10-17-feat/summary.md"
+write_preflight_log "$TMP" "2026-10-17-feat" "$(git -C "$WT" rev-parse HEAD)"
 ERR=$(cd "$TMP" && bash "$INT" --task-dir .powerflow/2026-10-17-feat --verify-command true --offline --allow-stale-base 2>&1 >/dev/null); CODE=$?
 assert_exit "integ-overlap-exit" 0 "$CODE"
 printf '%s' "$ERR" | grep -Eq 'shared\.txt' && pass "integ-overlap-warned" || fail "integ-overlap-warned" "overlap file not reported"
 grep -Eq '^OVERLAP: .*shared\.txt' "$TMP/.powerflow/2026-10-17-feat/executions/merge-verification.log" && pass "integ-overlap-logged" || fail "integ-overlap-logged" "overlap not in merge log"
+trap - EXIT; rm -rf "$TMP"
+
+# 8. Preflight evidence gate: no log (exit 4), stale log (exit 4),
+#    --skip-preflight bypasses explicitly.
+read -r TMP SLUG WT < <(make_integ_task); trap 'rm -rf "$TMP"' EXIT
+rm "$TMP/.powerflow/$SLUG/executions/pre-integration-test-run.log"
+(cd "$TMP" && bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command true --offline >/dev/null 2>&1); CODE=$?
+assert_exit "integ-preflight-missing" 4 "$CODE"
+git -C "$TMP" show-ref --verify --quiet refs/heads/powerflow/feat && pass "integ-preflight-kept" || fail "integ-preflight-kept" "branch touched on preflight refusal"
+printf 'more\n' >> "$WT/work.txt"; git -C "$WT" add work.txt; git -C "$WT" commit -qm "TASK-002: more"
+write_preflight_log "$TMP" "$SLUG" "$(git -C "$TMP" rev-parse main)"
+(cd "$TMP" && bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command true --offline >/dev/null 2>&1); CODE=$?
+assert_exit "integ-preflight-stale-sha" 4 "$CODE"
+(cd "$TMP" && bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command true --offline --skip-preflight >/dev/null 2>&1); CODE=$?
+assert_exit "integ-preflight-skipped" 0 "$CODE"
+[ -f "$TMP/work.txt" ] && pass "integ-preflight-skipped-merged" || fail "integ-preflight-skipped-merged" "skip-preflight merge missing"
 trap - EXIT; rm -rf "$TMP"
 
 summary_of

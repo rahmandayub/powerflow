@@ -12,6 +12,15 @@ set -euo pipefail
 # Stdout prints the final .powerflow/<resolved-slug> — capture it and derive
 # --task-slug for isolate-branch.sh from its basename so dir and branch stay
 # in sync after a -02 fallback.
+#
+# Metadata anchoring (multi-task): inside a git repo the directory is ALWAYS
+# created under the MAIN worktree root (<main>/.powerflow/), never under the
+# caller's cwd — a coordinator invoking this from inside a task worktree must
+# not scatter task state across worktrees (list-tasks.sh only scans the main
+# root). Stdout stays main-root-relative (.powerflow/<slug>): resolve it
+# against the main root, not against cwd. The .gitignore mutation likewise
+# targets the main root, so no gitignore file ever leaks into a task branch
+# diff. Outside any repo, cwd is used (legacy single-dir behavior).
 
 TASK_SLUG=""
 NO_GITIGNORE=false
@@ -50,10 +59,24 @@ else
   AUTO_PREFIXED=false
 fi
 
+# Anchor: main worktree root inside a repo (never the caller's worktree),
+# else cwd. PF_BASE is the absolute metadata base; stdout stays
+# main-root-relative so existing consumers ($ROOT/$OUT) keep working.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  MAIN_ROOT=$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0, 10); exit}')
+  if [ -z "$MAIN_ROOT" ]; then
+    MAIN_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || MAIN_ROOT="$PWD"
+  fi
+  PF_BASE="$MAIN_ROOT/.powerflow"
+else
+  PF_BASE="$PWD/.powerflow"
+fi
+
+TASK_DIR_ABS="$PF_BASE/$TASK_SLUG"
 TASK_DIR=".powerflow/$TASK_SLUG"
 
-if [ -d "$TASK_DIR" ]; then
-  if [ -n "$(ls -A "$TASK_DIR")" ]; then
+if [ -d "$TASK_DIR_ABS" ]; then
+  if [ -n "$(ls -A "$TASK_DIR_ABS")" ]; then
     # Same-minute collision on a just-auto-prefixed slug: find a free
     # -02/-03/... suffix instead of forcing the agent to ask the user.
     # Explicitly dated slugs still exit 2 so resume intent is preserved.
@@ -61,7 +84,7 @@ if [ -d "$TASK_DIR" ]; then
       RESOLVED=""
       for i in $(seq 2 99); do
         CAND="${TASK_SLUG}-$(printf '%02d' "$i")"
-        if [ ! -e ".powerflow/$CAND" ]; then
+        if [ ! -e "$PF_BASE/$CAND" ]; then
           RESOLVED="$CAND"
           break
         fi
@@ -69,6 +92,7 @@ if [ -d "$TASK_DIR" ]; then
       if [ -n "$RESOLVED" ]; then
         echo "[COLLISION-RESOLVED] $TASK_DIR exists; using .powerflow/$RESOLVED instead." >&2
         TASK_SLUG="$RESOLVED"
+        TASK_DIR_ABS="$PF_BASE/$TASK_SLUG"
         TASK_DIR=".powerflow/$TASK_SLUG"
       else
         echo "[COLLISION] $TASK_DIR exists with content. Resume it or pick a new slug." >&2
@@ -84,14 +108,15 @@ if [ -d "$TASK_DIR" ]; then
   fi
 fi
 
-mkdir -p "$TASK_DIR"/{context,plans,reviews,executions/diagnostics,reports}
+mkdir -p "$TASK_DIR_ABS"/{context,plans,reviews,executions/diagnostics,reports}
 
-# Ensure .powerflow/ is gitignored (unless opted out — announce either way)
+# Ensure .powerflow/ is gitignored (unless opted out — announce either way).
+# Always the MAIN root's .gitignore: writing it into a task worktree would
+# leak an untracked file into the task branch diff.
 if [ "$NO_GITIGNORE" = true ]; then
   echo "Skipped .gitignore handling (--no-gitignore)." >&2
 elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  GIT_ROOT=$(git rev-parse --show-toplevel)
-  GITIGNORE="$GIT_ROOT/.gitignore"
+  GITIGNORE="$MAIN_ROOT/.gitignore"
   if [ -f "$GITIGNORE" ]; then
     if ! grep -qxE '^\.?powerflow/?$' "$GITIGNORE" && ! grep -q '^\.powerflow/' "$GITIGNORE"; then
       printf "\n# Powerflow task directory\n.powerflow/\n" >> "$GITIGNORE"

@@ -22,12 +22,16 @@ set -euo pipefail
 #   the current checkout. The current branch is left untouched, so N tasks can
 #   run in parallel from the same base. Porcelain additionally emits
 #   WORKTREE_PATH=<absolute path>.
-#   - Dirty tree in the current checkout does NOT block: the new worktree is
-#     clean by construction; uncommitted changes stay behind (noted on stderr).
-#   - Detached HEAD does NOT block either: the worktree is created from HEAD
-#     (or --base-sha when given) plus the resolved integration base.
+#   - New worktrees start from the resolved integration base TIP, never from
+#     the caller's HEAD: invoking this from inside another task's worktree
+#     cannot inherit that task's commits. --base-sha pins an explicit start
+#     point for intentional stacked work only.
+#   - Dirty tree in the current checkout does NOT block: nothing is taken from
+#     the caller checkout. Detached HEAD does NOT block either.
 #   - Re-running with the same slug+path while that worktree already holds the
-#     task branch resumes (ACTION=reused); any other collision is exit 1.
+#     task branch resumes (ACTION=reused) and re-derives Base SHA from the
+#     task branch fork point, so a moved base can never rewrite the original
+#     baseline; any other collision is exit 1.
 
 FORCE=false
 BASE_BRANCH_OVERRIDE=""
@@ -245,12 +249,24 @@ if [ "$WORKTREE_MODE" = true ]; then
   esac
 
   # Resume: same path already registered AND already on the task branch.
+  # The baseline is re-derived from the TASK BRANCH fork point — never from
+  # the caller's current HEAD — so resuming after the base advanced cannot
+  # rewrite history: the recorded Base SHA stays the commit the branch
+  # actually forked from.
   if git worktree list --porcelain | grep -qx "worktree $ABS_WT"; then
     WT_BRANCH=$(git -C "$ABS_WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "UNKNOWN")
     if [ "$WT_BRANCH" = "$POWERFLOW_BRANCH" ]; then
       echo "Reusing worktree $ABS_WT on $POWERFLOW_BRANCH (resume)." >&2
       TASK_BRANCH="$POWERFLOW_BRANCH"
       ACTION="reused"
+      if [ -n "$BASE_SHA_OVERRIDE" ]; then
+        BASE_SHA="$BASE_SHA_OVERRIDE"
+      else
+        BASE_SHA=$(git merge-base "$TASK_BRANCH" "$BASE_REF" 2>/dev/null) || {
+          echo "Error: no merge base between $TASK_BRANCH and $BASE_REF — wrong integration base?" >&2
+          exit 1
+        }
+      fi
       if [ "$PORCELAIN_OUT" = true ]; then
         echo "BASE_BRANCH=$INTEGRATION_BASE"
         echo "BASE_REF=$BASE_REF"
@@ -273,19 +289,23 @@ if [ "$WORKTREE_MODE" = true ]; then
     exit 1
   fi
 
-  # Start point mirrors branch mode (HEAD) unless --base-sha pins it.
-  # Uncommitted changes in the current checkout stay behind by design.
+  # Start point is the resolved integration base tip — NEVER the caller's
+  # HEAD. A coordinator may invoke this from inside another task's worktree;
+  # starting from HEAD there would silently inherit that task's commits and
+  # leak unfinished work into the new task (and later into the integration
+  # branch). --base-sha remains for intentional stacked work only.
   if [ -n "$BASE_SHA_OVERRIDE" ]; then
     START_POINT="$BASE_SHA_OVERRIDE"
+    BASE_SHA="$BASE_SHA_OVERRIDE"
   else
-    START_POINT=$(git rev-parse HEAD) || {
-      echo "Error: cannot resolve HEAD as worktree start point" >&2
+    START_POINT=$(git rev-parse --verify "${BASE_REF}^{commit}" 2>/dev/null) || {
+      echo "Error: cannot resolve base ref $BASE_REF as worktree start point" >&2
       exit 1
     }
-    PORCELAIN_DIRTY=$(git status --porcelain 2>/dev/null | grep -v '^??' | grep -v '^ *$' || true)
-    if [ -n "$PORCELAIN_DIRTY" ]; then
-      echo "Note: dirty tree in current checkout stays behind; new worktree starts clean at ${START_POINT:0:7}." >&2
-    fi
+    BASE_SHA=$(git merge-base "$START_POINT" "$BASE_REF" 2>/dev/null) || {
+      echo "Error: no merge base between $START_POINT and $BASE_REF" >&2
+      exit 1
+    }
   fi
 
   if ! git worktree add -b "$POWERFLOW_BRANCH" "$ABS_WT" "$START_POINT" >&2; then

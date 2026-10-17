@@ -10,9 +10,10 @@ set -euo pipefail
 # assumed safe once combined. On any failure the task branch AND worktree are
 # kept for recovery; cleanup happens only after verification passes.
 #
-# Flow: acquire lock -> pre-checks -> resolve integration branch -> locate the
-# owning worktree (<loc>) -> sync (ff-only pull) -> stale/diverged gate ->
-# overlap advisory -> merge -> verify -> cleanup worktree+branch -> release.
+# Flow: acquire lock -> pre-checks -> preflight evidence gate -> resolve
+# integration branch -> locate the owning worktree (<loc>) -> sync (ff-only
+# pull) -> stale/diverged gate -> overlap advisory -> merge -> verify ->
+# cleanup worktree+branch -> release.
 #
 # The orchestrator records decisions in summary.md (this script writes nothing
 # there); the script appends machine-readable verification blocks to
@@ -20,8 +21,13 @@ set -euo pipefail
 #
 # Usage:
 #   integrate-task.sh --task-dir <dir> --verify-command <cmd> [--verify-command <cmd2>...]
-#     [--allow-stale-base] [--offline] [--stale-after N] [--porcelain]
+#     [--allow-stale-base] [--offline] [--skip-preflight] [--stale-after N] [--porcelain]
 #
+#   Before merging, the Finishing preflight gate (validate-transition.sh
+#   --preflight: Tier 1+2 PASS at the task HEAD, Tier 3 or a Small-task
+#   waiver, clean tree, on the task branch) must pass inside the task
+#   worktree — --verify-command alone (e.g. `true`) proves nothing about the
+#   pre-merge evidence. --skip-preflight bypasses this explicitly and logs it.
 #   --verify-command runs in <loc> after the merge (Tier 1 smoke, Tier 2
 #     affected, Tier 3 full — pass each as a separate flag, in order).
 #     At least one is required: merging without verification is refused.
@@ -42,6 +48,7 @@ TASK_DIR=""
 ALLOW_STALE_BASE=false
 OFFLINE=false
 PORCELAIN_OUT=false
+SKIP_PREFLIGHT=false
 STALE_AFTER=1800
 VERIFY_CMDS=()
 
@@ -51,9 +58,10 @@ while [[ $# -gt 0 ]]; do
     --verify-command) VERIFY_CMDS+=("${2:-}"); shift 2 ;;
     --allow-stale-base) ALLOW_STALE_BASE=true; shift ;;
     --offline) OFFLINE=true; shift ;;
+    --skip-preflight) SKIP_PREFLIGHT=true; shift ;;
     --stale-after) STALE_AFTER="${2:-}"; shift 2 ;;
     --porcelain) PORCELAIN_OUT=true; shift ;;
-    *) echo "Usage: integrate-task.sh --task-dir <dir> --verify-command <cmd> [...] [--allow-stale-base] [--offline] [--stale-after N] [--porcelain]" >&2; exit 2 ;;
+    *) echo "Usage: integrate-task.sh --task-dir <dir> --verify-command <cmd> [...] [--allow-stale-base] [--offline] [--skip-preflight] [--stale-after N] [--porcelain]" >&2; exit 2 ;;
   esac
 done
 
@@ -73,7 +81,16 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LOCK_SH="$SCRIPT_DIR/integration-lock.sh"
 RESOLVE_SH="$SCRIPT_DIR/resolve-integration-branch.sh"
 
-TASK_DIR_ABS=$(realpath -m "$TASK_DIR")
+# Task metadata lives in the MAIN root's .powerflow/ (see init-task-dir.sh):
+# a relative --task-dir resolves against the main root, never against the
+# caller's cwd — finishing from inside a task worktree with
+# --task-dir .powerflow/<slug> must find the same summary.md.
+MAIN_ROOT_EARLY=$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0, 10); exit}')
+[ -n "$MAIN_ROOT_EARLY" ] || { echo "Error: cannot resolve repository root" >&2; exit 1; }
+case "$TASK_DIR" in
+  /*) TASK_DIR_ABS=$(realpath -m "$TASK_DIR") ;;
+  *) TASK_DIR_ABS=$(realpath -m "$MAIN_ROOT_EARLY/$TASK_DIR") ;;
+esac
 SUMMARY="$TASK_DIR_ABS/summary.md"
 [ -f "$SUMMARY" ] || { echo "Error: summary.md not found at $SUMMARY" >&2; exit 2; }
 TASK_SLUG=$(basename "$TASK_DIR_ABS")
@@ -99,18 +116,36 @@ if ! git show-ref --verify --quiet "refs/heads/$TASK_BRANCH" 2>/dev/null; then
   exit 1
 fi
 
-MAIN_ROOT=$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0, 10); exit}')
-[ -n "$MAIN_ROOT" ] || { echo "Error: cannot resolve repository root" >&2; exit 1; }
+MAIN_ROOT="$MAIN_ROOT_EARLY"
 
 # --- acquire the integration lock (released by trap) ---------------------------
+# A heartbeat refreshes the lease for the whole run: even a >STALE_AFTER
+# integration is never mistaken for a crash while this process lives. A real
+# crash stops the heartbeat, so the queue still recovers via steal.
+HEART_PID_INT=""
+stop_integrate_heartbeat() {
+  if [ -n "$HEART_PID_INT" ]; then
+    kill "$HEART_PID_INT" 2>/dev/null || true
+    wait "$HEART_PID_INT" 2>/dev/null || true
+    HEART_PID_INT=""
+  fi
+}
 LOCK_HELD=false
 release_lock() {
+  stop_integrate_heartbeat
   if [ "$LOCK_HELD" = true ]; then
     bash "$LOCK_SH" release --task "$TASK_SLUG" >/dev/null 2>&1 || true
     LOCK_HELD=false
   fi
 }
 trap release_lock EXIT
+heartbeat_every() {
+  local want="${POWERFLOW_HEARTBEAT_INTERVAL:-60}" third
+  [[ "$want" =~ ^[0-9]+$ ]] && [ "$want" -ge 1 ] || want=60
+  third=$((STALE_AFTER / 3))
+  [ "$third" -lt 1 ] && third=1
+  [ "$want" -lt "$third" ] && printf '%s' "$want" || printf '%s' "$third"
+}
 # NOTE: no `!` here — `$?` after `! cmd` is the negated status (always 0).
 bash "$LOCK_SH" acquire --task "$TASK_SLUG" --stale-after "$STALE_AFTER" >&2
 CODE=$?
@@ -120,6 +155,12 @@ if [ "$CODE" -ne 0 ]; then
   exit "$CODE"  # 3 held, 1 race/error
 fi
 LOCK_HELD=true
+EVERY=$(heartbeat_every)
+( while true; do
+    sleep "$EVERY"
+    bash "$LOCK_SH" heartbeat --task "$TASK_SLUG" >/dev/null 2>&1 || true
+  done ) &
+HEART_PID_INT=$!
 
 fail() { echo "Error: $1" >&2; exit "${2:-1}"; }
 
@@ -137,6 +178,27 @@ if [ -n "$WT_PATH" ]; then
   fi
 fi
 TASK_HEAD=$(git rev-parse --verify --quiet "$TASK_BRANCH") || fail "cannot resolve task branch $TASK_BRANCH"
+
+# --- pre-integration evidence gate: the task must have passed the Finishing
+# preflight (Tier 1+2 at HEAD, Tier 3 or Small-waiver, clean tree, on the task
+# branch) BEFORE it may enter the shared branch. Runs in the task worktree so
+# HEAD/SHA checks evaluate the task checkout, not the caller's. Legacy
+# branch-mode tasks without a live worktree cannot be gated here — they
+# proceed with a warning (the orchestrator ran the gates manually).
+# --skip-preflight is an explicit, logged escape hatch for extraordinary cases.
+VALIDATE_SH="$SCRIPT_DIR/../../using-powerflow/scripts/validate-transition.sh"
+if [ "$SKIP_PREFLIGHT" = true ]; then
+  echo "WARNING: --skip-preflight given; pre-integration evidence NOT checked." >&2
+elif [ "$WT_ACTIVE" = true ]; then
+  PREFLIGHT_OUT=$(cd "$WT_PATH" && bash "$VALIDATE_SH" --task-dir "$TASK_DIR_ABS" --preflight 2>&1) || {
+    echo "Error: pre-integration preflight FAILED for $TASK_BRANCH at $TASK_HEAD — run the missing tiers (or record a Tier 3 waiver for Small tasks) before queueing:" >&2
+    printf '%s\n' "$PREFLIGHT_OUT" >&2
+    exit 4
+  }
+  echo "Preflight passed for $TASK_BRANCH at ${TASK_HEAD:0:7}." >&2
+else
+  echo "Note: no live task worktree — preflight gate skipped (branch mode); ensure validate-transition.sh --preflight passed manually." >&2
+fi
 
 # --- resolve integration branch + locate owning worktree (<loc>) ----------------
 INTEGRATION_BRANCH=$(bash "$RESOLVE_SH" --task-dir "$TASK_DIR_ABS" --porcelain 2>/dev/null | grep '^INTEGRATION_BRANCH=' | cut -d= -f2 || true)
@@ -251,7 +313,12 @@ for cmd in "${VERIFY_CMDS[@]}"; do
     VERIFY_OK=false
     echo "Error: post-merge verification FAILED (exit $CMD_CODE): $cmd" >&2
     echo "Merged result kept in place at $MERGE_SHA — branch and worktree NOT deleted." >&2
-    echo "Recover by fixing forward, or undo the merge with: git -C $LOC reset --hard $INT_HEAD_BEFORE" >&2
+    echo "Recovery: fix forward in $LOC, or undo ONLY if the integration branch" >&2
+    echo "is untouched since this merge (the lock is released now, so others may" >&2
+    echo "have committed since — resetting then would delete their commits):" >&2
+    echo "  test \"\$(git -C \"$LOC\" rev-parse HEAD)\" = \"$MERGE_SHA\" && \\" >&2
+    echo "    git -C \"$LOC\" reset --hard $INT_HEAD_BEFORE ||" >&2
+    echo "    echo 'HEAD moved since the merge — do NOT reset; fix forward or revert the task commits individually'" >&2
     echo "Task recovery ref: git branch $TASK_BRANCH $TASK_HEAD" >&2
     if [ "$PORCELAIN_OUT" = true ]; then
       printf 'INTEGRATION_BRANCH=%s\nMERGE_SHA=%s\nVERIFY=failed\nOVERLAP=%s\n' "$INTEGRATION_BRANCH" "$MERGE_SHA" "$OVERLAP"
@@ -293,4 +360,14 @@ if [ "$PORCELAIN_OUT" = true ]; then
   printf 'INTEGRATION_BRANCH=%s\nMERGE_SHA=%s\nVERIFY=passed\nOVERLAP=%s\nCLEANUP=done\n' "$INTEGRATION_BRANCH" "$MERGE_SHA" "$OVERLAP"
 fi
 echo "Integrated $TASK_BRANCH into $INTEGRATION_BRANCH at $MERGE_SHA (verified)." >&2
+# Dependents unblock ONLY on this explicit closeout record (list-tasks.sh
+# dep_complete): the orchestrator must append it to summary.md — entering
+# Finishing alone never satisfies a dependency.
+TODAY=$(date +%F)
+{
+  echo "--- record in summary.md (required to unblock dependents) ---"
+  echo "- Integration: merged — $TODAY"
+  echo "- Merge SHA: $MERGE_SHA"
+  echo "- Post-merge verification: passed — $TODAY (${#VERIFY_CMDS[@]} command(s) on merged result; see executions/merge-verification.log)"
+} >&2
 exit 0

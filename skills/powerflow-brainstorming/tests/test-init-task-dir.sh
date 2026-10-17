@@ -73,6 +73,22 @@ AFTER=$(md5sum "$TMP/.gitignore" | cut -d' ' -f1)
 [ "$BEFORE" = "$AFTER" ] && pass "init-nogitignore-identical" || fail "init-nogitignore-identical" ".gitignore mutated"
 rm -rf "$TMP"; trap - EXIT
 
+# 4b. Invoked from INSIDE a task worktree: metadata still lands in the MAIN
+#     root (never inside the worktree), stdout stays main-root-relative, and
+#     .gitignore is touched only in the main root (no scope leak into the
+#     task branch diff).
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+git -C "$TMP" worktree add -q "$TMP/.worktrees/wt-a" -b wt-a 2>/dev/null
+OUT=$(cd "$TMP/.worktrees/wt-a" && bash "$INIT" --task-slug 2026-01-09-fromwt 2>/dev/null); CODE=$?
+assert_exit "init-wt-exit" 0 "$CODE"
+[ "$OUT" = ".powerflow/2026-01-09-fromwt" ] && pass "init-wt-stdout" || fail "init-wt-stdout" "got $OUT"
+[ -d "$TMP/$OUT/context" ] && pass "init-wt-main-dir" || fail "init-wt-main-dir" "task dir not in main root"
+[ ! -e "$TMP/.worktrees/wt-a/.powerflow" ] && pass "init-wt-no-scatter" || fail "init-wt-no-scatter" ".powerflow scattered into task worktree"
+[ ! -e "$TMP/.worktrees/wt-a/.gitignore" ] && pass "init-wt-no-gitignore-leak" || fail "init-wt-no-gitignore-leak" ".gitignore leaked into task worktree"
+grep -Eq '^\.powerflow/$' "$TMP/.gitignore" && pass "init-wt-main-gitignore" || fail "init-wt-main-gitignore" "main .gitignore not updated"
+git -C "$TMP" worktree remove --force "$TMP/.worktrees/wt-a" 2>/dev/null
+rm -rf "$TMP"; trap - EXIT
+
 # 5. Missing --task-slug -> exit 1
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 (cd "$TMP" && bash "$INIT" >/dev/null 2>&1); CODE=$?

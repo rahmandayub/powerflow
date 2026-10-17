@@ -68,7 +68,36 @@ assert_contains "worktree-pin-sha" "$OUT" "^BASE_SHA=$PINNED$"
 assert_exit "worktree-pin-badsha" 1 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
-# 6. Collisions: existing branch with a DIFFERENT path, occupied path, bad slug.
+# 6. Independence: creating B from INSIDE A's worktree still starts B from
+#    the base tip — B never inherits A's commits.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+(cd "$TMP" && bash "$ISOLATE" --task-slug wta --worktree-path .worktrees/wta --porcelain >/dev/null 2>&1)
+commit_file "$TMP/.worktrees/wta" a.txt "a" "task A work"
+A_HEAD=$(git -C "$TMP/.worktrees/wta" rev-parse HEAD)
+BASE_TIP=$(git -C "$TMP" rev-parse main)
+OUT=$(cd "$TMP/.worktrees/wta" && bash "$ISOLATE" --task-slug wtb --worktree-path .worktrees/wtb --porcelain 2>/dev/null); CODE=$?
+assert_exit "worktree-independence-exit" 0 "$CODE"
+B_HEAD=$(git -C "$TMP/.worktrees/wtb" rev-parse HEAD)
+[ "$B_HEAD" = "$BASE_TIP" ] && pass "worktree-independence-tip" || fail "worktree-independence-tip" "B at $B_HEAD, base tip $BASE_TIP"
+[ "$B_HEAD" != "$A_HEAD" ] && pass "worktree-independence-no-inherit" || fail "worktree-independence-no-inherit" "B inherited A's HEAD"
+git -C "$TMP" merge-base --is-ancestor "$A_HEAD" "$B_HEAD" 2>/dev/null; CODE=$?
+[ "$CODE" -ne 0 ] && pass "worktree-independence-no-ancestor" || fail "worktree-independence-no-ancestor" "A's commits reachable from B"
+[ -z "$(git -C "$TMP" log --format=%H "$B_HEAD" --not main 2>/dev/null)" ] && pass "worktree-independence-clean-diff" || fail "worktree-independence-clean-diff" "B has commits beyond base"
+rm -rf "$TMP"; trap - EXIT
+
+# 7. Resume after the base moved: baseline stays at the original fork point.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT1=$(cd "$TMP" && bash "$ISOLATE" --task-slug wtr2 --worktree-path .worktrees/wtr2 --porcelain 2>/dev/null)
+SHA1=$(printf '%s' "$OUT1" | grep '^BASE_SHA=' | cut -d= -f2)
+commit_file "$TMP" advance.txt "2" "advance base"
+OUT2=$(cd "$TMP" && bash "$ISOLATE" --task-slug wtr2 --worktree-path .worktrees/wtr2 --porcelain 2>/dev/null); CODE=$?
+assert_exit "worktree-resume-stable-exit" 0 "$CODE"
+SHA2=$(printf '%s' "$OUT2" | grep '^BASE_SHA=' | cut -d= -f2)
+[ "$SHA2" = "$SHA1" ] && pass "worktree-resume-stable-sha" || fail "worktree-resume-stable-sha" "BASE_SHA moved $SHA1 -> $SHA2 on resume"
+assert_contains "worktree-resume-stable-action" "$OUT2" "^ACTION=reused$"
+rm -rf "$TMP"; trap - EXIT
+
+# 8. Collisions: existing branch with a DIFFERENT path, occupied path, bad slug.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 (cd "$TMP" && bash "$ISOLATE" --task-slug wtc --worktree-path .worktrees/wtc --porcelain >/dev/null 2>&1)
 (cd "$TMP" && bash "$ISOLATE" --task-slug wtc --worktree-path .worktrees/other --porcelain >/dev/null 2>&1); CODE=$?

@@ -11,11 +11,12 @@ LIST="$SKILLS_ROOT/using-powerflow/scripts/list-tasks.sh"
 ISOLATE="$SKILLS_ROOT/powerflow-executing/scripts/isolate-branch.sh"
 
 # Writes a minimal summary.md for a task dir. Args:
-#   write_summary <repo> <slug> <phase> [<depends>] [<porcelain-out-file>]
+#   write_summary <repo> <slug> <phase> [<depends>] [<porcelain-out-file>] [<extra-lines>]
 # When <porcelain-out-file> (isolate --porcelain stdout) is given, its Git
 # State is recorded; otherwise the task has no branch/worktree yet.
+# <extra-lines> (e.g. Integration closeout) is appended verbatim.
 write_summary() {
-  local repo="$1" slug="$2" phase="$3" depends="${4:-}" porc="${5:-}"
+  local repo="$1" slug="$2" phase="$3" depends="${4:-}" porc="${5:-}" extra="${6:-}"
   local dir="$repo/.powerflow/$slug" base_branch="" base_ref="" base_sha=""
   local task_branch="" isolation="" wt_path=""
   mkdir -p "$dir"
@@ -38,6 +39,7 @@ write_summary() {
     [ -n "$task_branch" ] && printf -- '- Task branch: %s\n' "$task_branch"
     [ -n "$isolation" ] && printf -- '- Isolation: %s\n' "$isolation"
     [ -n "$wt_path" ] && printf -- '- Worktree path: %s\n' "$wt_path"
+    [ -n "$extra" ] && printf '%s\n' "$extra"
   } > "$dir/summary.md"
 }
 
@@ -71,6 +73,20 @@ HUMAN=$(cd "$TMP" && bash "$LIST" 2>/dev/null)
 assert_contains "list-two-human" "$HUMAN" "2026-10-17-aaa"
 rm -rf "$TMP"; trap - EXIT
 
+# 2b. Breakdown: live worktree counts as executing, kept branch as retained.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+O1=$(cd "$TMP" && bash "$ISOLATE" --task-slug aaa --worktree-path .worktrees/aaa --porcelain 2>/dev/null)
+O2=$(cd "$TMP" && bash "$ISOLATE" --task-slug bbb --worktree-path .worktrees/bbb --porcelain 2>/dev/null)
+write_summary "$TMP" "2026-10-17-aaa" "Executing" "" "$O1"
+write_summary "$TMP" "2026-10-17-bbb" "Finishing" "" "$O2" "- Integration: kept — 2026-10-17 (branch preserved for PR)"
+WTB=$(printf '%s' "$O2" | grep '^WORKTREE_PATH=' | cut -d= -f2)
+git -C "$TMP" worktree remove --force "$WTB"
+OUT=$(cd "$TMP" && bash "$LIST" --porcelain 2>/dev/null)
+assert_contains "list-exec-count" "$OUT" "^EXECUTING_TASKS=1$"
+assert_contains "list-ret-count" "$OUT" "^RETAINED_BRANCHES=1$"
+assert_contains "list-hold-conservative" "$OUT" "^HOLDING_RESOURCES=2$"
+rm -rf "$TMP"; trap - EXIT
+
 # 3. Slots: third task blocked at max 2, ready at max 3 and via env override.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 O1=$(cd "$TMP" && bash "$ISOLATE" --task-slug aaa --worktree-path .worktrees/aaa --porcelain 2>/dev/null)
@@ -98,9 +114,11 @@ write_summary "$TMP" "2026-10-17-bbb" "Executing" "" "$O2"
 assert_exit "list-slots-self-resume" 0 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
-# 5. Dependency block/unblock: ccc waits for aaa until Finishing.
+# 5. Dependency block/unblock: ccc waits for aaa until it is MERGED+verified.
+#    Entering Finishing alone never unblocks (the merge may still fail).
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 O1=$(cd "$TMP" && bash "$ISOLATE" --task-slug aaa --worktree-path .worktrees/aaa --porcelain 2>/dev/null)
+MERGED_SHA=$(git -C "$TMP" rev-parse main)
 write_summary "$TMP" "2026-10-17-aaa" "Executing" "" "$O1"
 write_summary "$TMP" "2026-10-17-ccc" "Planning" "2026-10-17-aaa"
 (cd "$TMP" && bash "$LIST" --check-ready 2026-10-17-ccc --max-parallel 9 >/dev/null 2>&1); CODE=$?
@@ -109,6 +127,14 @@ OUT=$(cd "$TMP" && bash "$LIST" --check-ready 2026-10-17-ccc --porcelain --max-p
 assert_contains "list-deps-blocked-by" "$OUT" "^BLOCKED_BY=2026-10-17-aaa$"
 assert_contains "list-deps-overall" "$OUT" "^OVERALL=blocked$"
 write_summary "$TMP" "2026-10-17-aaa" "Finishing" "" "$O1"
+(cd "$TMP" && bash "$LIST" --check-ready 2026-10-17-ccc --max-parallel 9 >/dev/null 2>&1); CODE=$?
+assert_exit "list-deps-finishing-not-enough" 3 "$CODE"
+write_summary "$TMP" "2026-10-17-aaa" "Finishing" "" "$O1" "- Integration: kept — 2026-10-17 (branch preserved for PR)"
+(cd "$TMP" && bash "$LIST" --check-ready 2026-10-17-ccc --max-parallel 9 >/dev/null 2>&1); CODE=$?
+assert_exit "list-deps-kept-not-enough" 3 "$CODE"
+write_summary "$TMP" "2026-10-17-aaa" "Finishing" "" "$O1" "- Integration: merged — 2026-10-17
+- Merge SHA: $MERGED_SHA
+- Post-merge verification: passed — 2026-10-17 (see executions/merge-verification.log)"
 (cd "$TMP" && bash "$LIST" --check-ready 2026-10-17-ccc --max-parallel 9 >/dev/null 2>&1); CODE=$?
 assert_exit "list-deps-unblocked" 0 "$CODE"
 rm -rf "$TMP"; trap - EXIT

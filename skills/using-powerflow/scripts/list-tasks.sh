@@ -15,7 +15,9 @@ set -euo pipefail
 #   - Depends on: <slug-a>, <slug-b>
 # Slugs are .powerflow/ dir basenames (date prefix included). Missing line,
 # or a value of None/-/n/a, means independent. A dependency counts as complete
-# when its summary reports ## Phase: Finishing (integration decision recorded).
+# only when its summary records `- Integration: merged` AND
+# `- Post-merge verification: passed` (written at Finishing closeout —
+# entering Finishing is not enough, the merge may still fail).
 #
 # READINESS semantics: per-task DEPS_READY covers dependencies only. Whether a
 # task may actually start also needs SLOT_AVAILABLE (global). --check-ready
@@ -27,6 +29,14 @@ set -euo pipefail
 #   list-tasks.sh --check-ready <slug> [--porcelain] [--max-parallel N]
 #
 # --max-parallel defaults to $POWERFLOW_MAX_PARALLEL, else 2.
+#
+# Slot checks are ADVISORY, not atomic reservations: check and worktree
+# creation are separate steps, so two concurrent schedulers could both see a
+# free slot. Run all scheduling through ONE coordinator process (the
+# documented architecture) — that serialization is what makes the limit hold.
+# HOLDING stays conservative (live worktree OR existing branch); EXECUTING vs
+# RETAINED only explains the mix. A `kept`/PR branch holds its slot until the
+# branch is deleted — delete it once the PR merges.
 #
 # Exit codes: 0 ok (check-ready: OVERALL ready) | 1 error |
 #   2 usage, not a git repo, or task not found | 3 blocked (check-ready only)
@@ -89,12 +99,23 @@ phase_of() { # phase_of <summary> -> Brainstorming|Planning|...|unknown
   esac
 }
 
-dep_complete() { # dep_complete <slug> -> 0 if that task reached Finishing
-  local dep_summary dep_phase
+dep_complete() { # dep_complete <slug> -> 0 if explicitly integrated+verified
+  # Phase Finishing alone is NOT completion: it is the integration phase, and
+  # the merge may still fail or never happen. Only an explicit closeout record
+  # satisfies dependents: `Integration: merged` plus
+  # `Post-merge verification: passed`. Kept branches and unmerged PRs
+  # (`kept`, `pr`, `discarded`, `pending`) never satisfy a dependency on the
+  # integrated result.
+  local dep_summary integ ver
   dep_summary="$PF_DIR/$1/summary.md"
   [ -f "$dep_summary" ] || return 1
-  dep_phase=$(phase_of "$dep_summary")
-  [ "$dep_phase" = "Finishing" ]
+  integ=$(grep -Ei -m1 '^[*-][[:space:]]+Integration:' "$dep_summary" 2>/dev/null \
+    | sed -E 's/^[*-][[:space:]]+Integration:[[:space:]]*//I' || true)
+  ver=$(grep -Ei -m1 '^[*-][[:space:]]+Post-merge verification:' "$dep_summary" 2>/dev/null \
+    | sed -E 's/^[*-][[:space:]]+Post-merge verification:[[:space:]]*//I' || true)
+  printf '%s' "$integ" | grep -Eqi '^merged\b' || return 1
+  printf '%s' "$ver" | grep -Eqi '^passed\b' || return 1
+  return 0
 }
 
 # Per-task globals set by describe_task:
@@ -239,6 +260,25 @@ holding_count() { # holding_count [exclude-slug] -> number
   printf '%s' "$n"
 }
 
+resource_breakdown() { # resource_breakdown [exclude-slug] -> "executing retained"
+  # EXECUTING = live worktree (actively worked). RETAINED = branch kept with
+  # no live worktree (e.g. closeout `kept` for a PR — still occupies a slot
+  # until the branch is deleted). HOLDING (slot use) stays conservative:
+  # executing + retained.
+  local excl="${1:-}" s exec=0 ret=0
+  [ -z "$SLUGS" ] && { printf '0 0\n'; return 0; }
+  while IFS= read -r s; do
+    [ -n "$excl" ] && [ "$s" = "$excl" ] && continue
+    describe_task "$s"
+    if [ "$D_WT_STATUS" = "active" ]; then
+      exec=$((exec + 1))
+    elif [ "$D_BRANCH_STATUS" = "exists" ]; then
+      ret=$((ret + 1))
+    fi
+  done < <(printf '%s\n' "$SLUGS")
+  printf '%s %s\n' "$exec" "$ret"
+}
+
 print_task_porcelain() { # print_task_porcelain <slug>
   local s="$1"
   describe_task "$s"
@@ -256,6 +296,7 @@ print_task_porcelain() { # print_task_porcelain <slug>
 
 if [ -n "$CHECK_SLUG" ]; then
   HOLDING=$(holding_count "$CHECK_SLUG")
+  read -r EXEC_OTHER RET_OTHER < <(resource_breakdown "$CHECK_SLUG")
   describe_task "$CHECK_SLUG"
   SELF_HOLDS="$D_HOLDS"
   if [ "$HOLDING" -ge "$MAX_PARALLEL" ]; then
@@ -286,6 +327,8 @@ if [ -n "$CHECK_SLUG" ]; then
     print_task_porcelain "$CHECK_SLUG"
     printf 'MAX_PARALLEL=%s\n' "$MAX_PARALLEL"
     printf 'HOLDING_RESOURCES=%s\n' "$((HOLDING + $([ "$SELF_HOLDS" = "yes" ] && printf '1' || printf '0')))"
+    printf 'EXECUTING_TASKS=%s\n' "$EXEC_OTHER"
+    printf 'RETAINED_BRANCHES=%s\n' "$RET_OTHER"
     printf 'SLOT_AVAILABLE=%s\n' "$SLOT"
     printf 'OVERALL=%s\n' "$OVERALL"
     printf 'BLOCK_REASON=%s\n' "$REASON"
@@ -295,7 +338,8 @@ if [ -n "$CHECK_SLUG" ]; then
       "$D_PHASE" "${D_BRANCH:-none}" "$D_BRANCH_STATUS" "${D_WT_PATH:-in-place} [$D_WT_STATUS]"
     printf '  Depends on: %s | Blocked by: %s | Deps ready: %s\n' \
       "$D_DEPENDS" "$D_BLOCKED_BY" "$D_DEPS_READY"
-    printf '  Slots: holding %s (max %s) -> available: %s\n' "$HOLDING" "$MAX_PARALLEL" "$SLOT"
+    printf '  Slots: holding %s (executing %s, retained %s; max %s) -> available: %s\n' \
+      "$HOLDING" "$EXEC_OTHER" "$RET_OTHER" "$MAX_PARALLEL" "$SLOT"
     printf '  OVERALL: %s' "$OVERALL"
     [ "$REASON" != "none" ] && printf ' (%s)' "$REASON"
     printf '\n'
@@ -309,6 +353,7 @@ fi
 
 # List mode.
 HOLDING=$(holding_count)
+read -r EXEC_ALL RET_ALL < <(resource_breakdown)
 if [ "$HOLDING" -ge "$MAX_PARALLEL" ]; then
   SLOT_ALL="no"
 else
@@ -324,6 +369,8 @@ if [ "$PORCELAIN_OUT" = true ]; then
   fi
   printf 'TOTAL_TASKS=%s\n' "$TOTAL"
   printf 'HOLDING_RESOURCES=%s\n' "$HOLDING"
+  printf 'EXECUTING_TASKS=%s\n' "$EXEC_ALL"
+  printf 'RETAINED_BRANCHES=%s\n' "$RET_ALL"
   printf 'MAX_PARALLEL=%s\n' "$MAX_PARALLEL"
   printf 'SLOT_AVAILABLE=%s\n' "$SLOT_ALL"
 else
@@ -346,7 +393,7 @@ else
         "$s" "$D_PHASE" "$short_branch" "$D_WT_STATUS" "$D_BASE_STATUS" "$D_DEPENDS" "$ready"
     done < <(printf '%s\n' "$SLUGS")
   fi
-  printf 'Tasks: %s total, %s holding worktree/branch; slots: max %s -> available: %s\n' \
-    "$TOTAL" "$HOLDING" "$MAX_PARALLEL" "$SLOT_ALL"
+  printf 'Tasks: %s total, %s holding (%s executing, %s retained branches); slots: max %s -> available: %s\n' \
+    "$TOTAL" "$HOLDING" "$EXEC_ALL" "$RET_ALL" "$MAX_PARALLEL" "$SLOT_ALL"
 fi
 exit 0

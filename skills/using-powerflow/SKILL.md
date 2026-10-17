@@ -54,8 +54,12 @@ Cross-skill paths (e.g. `using-powerflow/references/complexity-rubric.md`) resol
 4. **Evidence rule**: two labels only — `FACT` (with `file:line`) and `ASSUMPTION` (always marked). Every claim in `brief.md` carries one label; bare claims are rewritten. Full rule: [global-epistemology.md](references/global-epistemology.md).
 
 5. **Task directory lifecycle**:
-   - Create it with `powerflow-brainstorming/scripts/init-task-dir.sh`. Exit 2 (exists with content) or 3 (orphan): ask the user — resume, reuse, or new slug. Never overwrite an existing task dir.
-   - Capture the script's stdout (`.powerflow/<resolved-slug>`); the basename is the canonical task identity. Pass that basename as `--task-slug` to `isolate-branch.sh` so dir and `powerflow/<slug>` branch stay in sync after a `-02` collision fallback.
+    - Create it with `powerflow-brainstorming/scripts/init-task-dir.sh`. Exit 2 (exists with content) or 3 (orphan): ask the user — resume, reuse, or new slug. Never overwrite an existing task dir.
+    - The directory is ALWAYS created under the MAIN worktree root, even when
+      invoked from inside a task worktree — task metadata never scatters
+      across worktrees. The script's stdout (`.powerflow/<resolved-slug>`) is
+      MAIN-root-relative: resolve it against the main root, never against cwd.
+    - Capture the script's stdout (`.powerflow/<resolved-slug>`); the basename is the canonical task identity. Pass that basename as `--task-slug` to `isolate-branch.sh` so dir and `powerflow/<slug>` branch stay in sync after a `-02` collision fallback.
    - `summary.md` is the state. If it exists, resume from the phase it records — do not reinitialize. There is no `state.json`.
 
 6. **Escalation**: if any review round fails twice in a row with the same blockers OR reaches 3 review rounds without approval, STOP and ask the user, writing the request to `<task-dir>/reports/blocker.md` (template in `powerflow-planning/SKILL.md`).
@@ -144,11 +148,14 @@ bash <skills-root>/using-powerflow/scripts/list-tasks.sh --check-ready <task-slu
   branch exists.
 - **Dependencies**: Planning records one line in `summary.md` (slugs are
   `.powerflow/` dir basenames, date prefix included):
-  `- Depends on: <slug-a>, <slug-b>` — or omit the line / write `None` for
-  independent tasks. A dependency counts as complete when its summary reaches
-  `## Phase: Finishing`. Unknown slugs, self-dependencies, and tasks without
-  `summary.md` block. Dependency cycles are not auto-resolved — break them by
-  removing one edge.
+  `- Depends on: <other-task-slug>` — or omit the line / write `None` for
+  independent tasks. A dependency counts as complete ONLY when its summary
+  records `- Integration: merged` plus `- Post-merge verification: passed`
+  (Finishing closeout, Section 8). Entering Finishing is not enough — the
+  merge may still fail. `kept` branches and unmerged PRs never satisfy a
+  dependency on the integrated result. Unknown slugs, self-dependencies, and
+  tasks without `summary.md` block. Dependency cycles are not auto-resolved —
+  break them by removing one edge.
 - **Dependent-task base**: default is the UPDATED integration base AFTER the
   dependency merges (re-run isolate then). Only pin `--base-sha` to the
   dependency's verified SHA for intentionally stacked work.
@@ -157,6 +164,11 @@ bash <skills-root>/using-powerflow/scripts/list-tasks.sh --check-ready <task-slu
   `POWERFLOW_MAX_PARALLEL`. `--check-ready` exits 0 (ready), 3 (blocked:
   `deps:...` and/or `slots:full`), 2 (usage/unknown task). A task's own
   worktree never counts against its own resume check.
+  Slot checks are advisory, not atomic reservations: run ALL scheduling
+  through one coordinator so check-then-create stays serialized. The registry
+  reports the mix as `EXECUTING` (live worktree) vs `RETAINED` (branch kept,
+  e.g. for a PR — still occupies a slot until deleted); slot availability
+  itself stays conservative (executing + retained).
 - This gate schedules work only — it never replaces `validate-transition.sh`
   phase gates. Run those as usual.
 - Queue order hint: integrate tasks with `BASE_STATUS=current` first; `stale`

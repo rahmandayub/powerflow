@@ -59,6 +59,35 @@ TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 assert_exit "lock-fresh-kept" 3 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
+# 4b. Heartbeat: owner refresh resets staleness; others cannot refresh.
+#     Legacy info files without HEARTBEAT fall back to SINCE.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 >/dev/null 2>&1)
+printf 'PID=1\nTASK=aaa\nSINCE=1\n' > "$TMP/.powerflow/.integration-lock/info"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-legacy-stale" "$OUT" "^LOCK=stale$"
+(cd "$TMP" && bash "$LOCK" heartbeat --task bbb >/dev/null 2>&1); CODE=$?
+assert_exit "lock-heartbeat-wrong" 1 "$CODE"
+(cd "$TMP" && bash "$LOCK" heartbeat --task aaa >/dev/null 2>&1); CODE=$?
+assert_exit "lock-heartbeat-exit" 0 "$CODE"
+(cd "$TMP" && bash "$LOCK" acquire --task ccc --stale-after 100 >/dev/null 2>&1); CODE=$?
+assert_exit "lock-heartbeat-protects" 3 "$CODE"
+grep -Eq '^HEARTBEAT=[0-9]+$' "$TMP/.powerflow/.integration-lock/info" && pass "lock-heartbeat-recorded" || fail "lock-heartbeat-recorded" "no HEARTBEAT line in lock info"
+rm -rf "$TMP"; trap - EXIT
+
+# 4c. Run mode outlives --stale-after: heartbeat keeps a slow child locked.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+(cd "$TMP" && POWERFLOW_HEARTBEAT_INTERVAL=1 bash "$LOCK" run --task slow --stale-after 2 -- sleep 4 >/dev/null 2>&1) &
+RUNPID=$!
+sleep 3
+(cd "$TMP" && bash "$LOCK" acquire --task thief --stale-after 2 >/dev/null 2>&1); CODE=$?
+assert_exit "lock-run-slow-held" 3 "$CODE"
+wait "$RUNPID"; CODE=$?
+assert_exit "lock-run-slow-done" 0 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-run-slow-free" "$OUT" "^LOCK=free$"
+rm -rf "$TMP"; trap - EXIT
+
 # 5. Run mode: holds during child, releases after, passes child exit code.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 (cd "$TMP" && bash "$LOCK" run --task aaa -- bash -c 'echo child-ok' >/dev/null 2>&1); CODE=$?
