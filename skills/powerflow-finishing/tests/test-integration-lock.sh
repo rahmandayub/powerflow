@@ -248,4 +248,76 @@ OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
 assert_contains "lock-rel-race-free" "$OUT" "^LOCK=free$"
 rm -rf "$TMP"; trap - EXIT
 
+# 10. Three-process release race: acquire must not delete the lease a late
+#     release parked in its aside.
+#     A (aaa, TOK_A) verifies its token, then pauses before moving.
+#     While it is paused, B (bbb, TOK_B) steals the backdated lease.
+#     A resumes and moves B's ACTIVE lease into .rel.<A> (token mismatch),
+#     then pauses again in the recovery gap. C acquires right there: it must
+#     wait (exit 3) and MUST NOT delete B's parked lease during cleanup.
+#     A then restores B and refuses its own release (exit 1).
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 --porcelain 2>/dev/null)
+TOK_A=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+printf 'PID=1\nTASK=aaa\nSINCE=1\nHEARTBEAT=1\nTOKEN=%s\n' "$TOK_A" > "$TMP/.powerflow/.integration-lock/info"
+# A: 2s pause after token check, then 4s pause after moving the dir aside.
+(cd "$TMP" && POWERFLOW_TEST_PAUSE_RELEASE=2 POWERFLOW_TEST_PAUSE_RELEASE_AFTER_MOVE=4 \
+  bash "$LOCK" release --task aaa --token "$TOK_A" >/dev/null 2>&1; echo "$?" > "$TMP/rel3.code") &
+REL3PID=$!
+sleep 0.4
+# B steals the backdated lease while A is in its pre-move pause.
+OUT_B=$(cd "$TMP" && bash "$LOCK" acquire --task bbb --stale-after 1 --porcelain 2>/dev/null); CODE=$?
+assert_exit "lock-3proc-steal" 0 "$CODE"
+TOK_B=$(printf '%s' "$OUT_B" | grep '^TOKEN=' | cut -d= -f2)
+[ -n "$TOK_B" ] && [ "$TOK_B" != "$TOK_A" ] && pass "lock-3proc-distinct" || fail "lock-3proc-distinct" "no new token for bbb"
+# Wait until A has moved B's lease aside and is paused in the recovery gap.
+MOVED=0
+for _ in $(seq 1 40); do
+  if grep -Rqs '^TOKEN=' "$TMP"/.powerflow/.integration-lock.rel.*/info 2>/dev/null; then MOVED=1; break; fi
+  sleep 0.1
+done
+[ "$MOVED" -eq 1 ] && pass "lock-3proc-rel-aside" || fail "lock-3proc-rel-aside" "release aside never appeared"
+# Status must not claim a plain free lock while the release is in progress.
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-3proc-status-release" "$OUT" "^RELEASE=in-progress$"
+# C acquires exactly in the gap; it must wait and never delete B's lease.
+(cd "$TMP" && bash "$LOCK" acquire --task ccc --stale-after 1 >/dev/null 2>&1); CODE=$?
+assert_exit "lock-3proc-c-held" 3 "$CODE"
+if grep -Rqs "^TOKEN=$TOK_B$" "$TMP"/.powerflow/.integration-lock.rel.*/info 2>/dev/null; then
+  pass "lock-3proc-b-parked-intact"
+else
+  fail "lock-3proc-b-parked-intact" "acquire cleanup deleted B's parked lease"
+fi
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-3proc-no-c-lease" "$OUT" "^LOCK=free$"
+wait "$REL3PID"
+REL3_CODE=$(cat "$TMP/rel3.code")
+assert_exit "lock-3proc-a-refused" 1 "$REL3_CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-3proc-b-restored-task" "$OUT" "^HOLDER_TASK=bbb$"
+assert_contains "lock-3proc-b-restored-token" "$OUT" "^HOLDER_TOKEN=$TOK_B$"
+(cd "$TMP" && bash "$LOCK" heartbeat --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-3proc-b-hb" 0 "$CODE"
+(cd "$TMP" && bash "$LOCK" release --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-3proc-b-rel" 0 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-3proc-free" "$OUT" "^LOCK=free$"
+rm -rf "$TMP"; trap - EXIT
+
+# 11. A corrupt or future-dated release intent must not lock acquisition out.
+#     Intents are written atomically, so an unparseable SINCE (or a SINCE in
+#     the future) means corruption/clock skew — treat it as stale and recover,
+#     never as an unbounded "release in progress".
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/.powerflow"
+: > "$TMP/.powerflow/.integration-lock.rel.9999.intent"
+(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 5 >/dev/null 2>&1); CODE=$?
+assert_exit "lock-bad-intent-not-blocking" 0 "$CODE"
+[ ! -e "$TMP/.powerflow/.integration-lock.rel.9999.intent" ] && pass "lock-bad-intent-cleaned" || fail "lock-bad-intent-cleaned" "malformed intent left behind"
+rm -rf "$TMP/.powerflow/.integration-lock"
+printf 'PID=1\nSINCE=%s\nWINDOW=999999999\nTOKEN=x\n' "$(( $(date +%s) + 100000 ))" > "$TMP/.powerflow/.integration-lock.rel.8888.intent"
+(cd "$TMP" && bash "$LOCK" acquire --task bbb --stale-after 5 >/dev/null 2>&1); CODE=$?
+assert_exit "lock-future-intent-not-blocking" 0 "$CODE"
+rm -rf "$TMP"; trap - EXIT
+
 summary_of

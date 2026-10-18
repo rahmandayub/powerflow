@@ -372,6 +372,17 @@ Rules (enforced by the script, same spirit as Sections 2–7):
      lock directory is atomically renamed aside first, then its token is
      verified before deletion. If takeover occurred during a pause, the
      replacement lease is restored unharmed and release is refused with exit 1.
+   - **Release asides are never blind garbage**: Before the rename, release
+     publishes an intent (`SINCE`, its own `WINDOW`, expected `TOKEN`). Acquire
+     never `rm -rf`s `.rel.*`/`.stale.*` wholesale: while the intent is fresh
+     (within the RELEASER's window) it waits instead of filling the recovery
+     gap, and a parked lease that is still fresh is restored, not deleted.
+     Only stale intents/asides are cleaned (the window is capped, and an
+     unparseable or future `SINCE` counts as stale, so a corrupt intent cannot
+     pin the lock). This closes the three-process race
+     where a third acquirer deleted the replacement lease a late release had
+     parked aside, while a release that truly dies still recovers after the
+     window expires.
 10. **Stacked tasks** (started with `--base-sha` on an UNMERGED dependency's
    commit) integrate in dependency order: after the dependency merges, the
    stacked task's Base SHA is an ancestor of the integration branch, so it

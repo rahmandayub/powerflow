@@ -31,6 +31,18 @@ set -euo pipefail
 #    aside first, and its token is verified before deletion. If takeover slipped
 #    in during a pause, the replacement lease is restored unharmed and release
 #    is refused with exit 1.
+# 3. Release asides are not blind garbage. A release publishes an intent
+#    (SINCE + its own WINDOW + expected TOKEN) BEFORE moving the lock dir, and
+#    acquire never rm -rf's .rel.*/.stale.* wholesale. While an intent is
+#    fresh (within the RELEASER's window, not the acquirer's; the window is
+#    capped and an unparseable/future SINCE counts as stale, so an intent can
+#    never pin the lock forever), acquire waits instead of filling the
+#    recovery gap; when an aside parks a lease that is still fresh, acquire
+#    restores it (mkdir election + move) rather than deleting it. Only stale
+#    intents/asides are cleaned, so a third
+#    acquirer can no longer delete a replacement lease displaced by a late
+#    release, while a release that truly dies still recovers after
+#    --stale-after.
 #
 # Architectural boundary:
 # A time-bounded lease with expiration (--stale-after) cannot provide
@@ -204,6 +216,159 @@ write_info() { # write_info <pid> <task> <since> <token> — atomic via tmp+mv
   mv -f "$tmp" "$INFO"
 }
 
+REL_PREFIX="$MAIN_ROOT/.powerflow/.integration-lock.rel"
+STALE_PREFIX="$MAIN_ROOT/.powerflow/.integration-lock.stale"
+
+intent_field() { # intent_field <file> <KEY>
+  grep -E "^$2=" "$1" 2>/dev/null | cut -d= -f2 || true
+}
+
+INTENT_MAX_WINDOW=86400 # cap: an intent may not pin the lock longer than a day
+
+intent_is_fresh() { # intent_is_fresh <intentfile> -> 0 while release is live
+  # The releaser records its own WINDOW (its --stale-after): an intent stays
+  # authoritative for as long as that release's lease model would, independent
+  # of the acquirer's own --stale-after. The window is capped, and a future
+  # SINCE (clock skew) is clamped, so no intent can block acquisition forever.
+  local ts window age now
+  ts=$(intent_field "$1" SINCE)
+  # Intents are written atomically, so a visible one always carries a numeric
+  # SINCE. An unparseable or future SINCE (corruption, clock skew) is stale,
+  # not "fresh forever": recover_asides then cleans it, and any lease it names
+  # is still judged on its own freshness before deletion.
+  [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+  now=$(now_s)
+  [ "$ts" -le "$now" ] || return 1
+  window=$(intent_field "$1" WINDOW)
+  [[ "$window" =~ ^[0-9]+$ ]] && [ "$window" -ge 1 ] || window="$STALE_AFTER"
+  [ "$window" -le "$INTENT_MAX_WINDOW" ] || window="$INTENT_MAX_WINDOW"
+  age=$(( now - ts ))
+  [ "$age" -lt "$window" ]
+}
+
+has_fresh_intent() { # 0 when some release intent is still authoritative
+  local intent
+  for intent in "$REL_PREFIX".*.intent; do
+    [ -f "$intent" ] || continue
+    intent_is_fresh "$intent" && return 0
+  done
+  return 1
+}
+
+restore_aside() { # restore_aside <aside> -> 0 restored into the lock path
+  # Single-winner restore without a non-portable rename-if-absent: mkdir is
+  # the election for the lock path (acquirers seeing an existing-but-unreadable
+  # dir wait, they never reset it), then the parked lease is moved back. info
+  # is moved last so a half-restored dir is never mistaken for a valid lease.
+  local aside="$1" entry
+  [ -d "$aside" ] && [ -f "$aside/info" ] || return 1
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  for entry in "$aside"/* "$aside"/.[!.]* "$aside"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    [ "$(basename "$entry")" = "info" ] && continue
+    mv -f "$entry" "$LOCK_DIR"/ 2>/dev/null || true
+  done
+  if ! mv -f "$aside/info" "$LOCK_DIR/info" 2>/dev/null; then
+    # Roll back so the parked lease stays intact in the aside.
+    for entry in "$LOCK_DIR"/* "$LOCK_DIR"/.[!.]* "$LOCK_DIR"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      mv -f "$entry" "$aside"/ 2>/dev/null || true
+    done
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$aside" 2>/dev/null || true
+  return 0
+}
+
+recover_asides() { # recover_asides -> 0 clear, 3 release in progress/live lease parked
+  # Never blind-delete an aside: it may be the active workspace of a paused
+  # release. Fresh release intents block acquisition; fresh leases parked in
+  # an aside are restored, not deleted; only stale artifacts are discarded.
+  local intent aside holder since hb tok expected force
+  # 1. Intent with no aside: crash/pause before the move. Fresh => release is
+  #    still in flight; stale => drop the intent and continue.
+  for intent in "$REL_PREFIX".*.intent; do
+    [ -f "$intent" ] || continue
+    aside="${intent%.intent}"
+    [ -d "$aside" ] && continue
+    if intent_is_fresh "$intent"; then
+      echo "WARNING: release in progress (${aside##*/}) — waiting." >&2
+      return 3
+    fi
+    rm -f "$intent" 2>/dev/null || true
+  done
+
+  # 2. Release asides. A fresh intent means the releaser is still working;
+  #    deleting here is the three-process race (a third acquirer deleting the
+  #    replacement lease parked by a late release). With a stale intent (or
+  #    none) recovery applies: finish an intended release, restore a live
+  #    displaced lease, discard a stale one.
+  for aside in "$REL_PREFIX".*; do
+    [ -d "$aside" ] || continue
+    intent="$aside.intent"
+    if [ -f "$intent" ] && intent_is_fresh "$intent"; then
+      echo "WARNING: release in progress (${aside##*/}) — waiting." >&2
+      return 3
+    fi
+    expected=""; force=""
+    if [ -f "$intent" ]; then
+      expected=$(intent_field "$intent" TOKEN)
+      force=$(intent_field "$intent" FORCE)
+    fi
+    if holder=$(read_info_at "$aside/info"); then
+      # shellcheck disable=SC2086
+      set -- $holder
+      since="$3"; hb="${4:-}"; tok="${5:-}"
+      if ! lock_is_stale "$since" "$hb"; then
+        # A live lease is parked here. If the abandoned intent names it, the
+        # owner asked to release it; otherwise a late release displaced a
+        # replacement lease, which must be restored.
+        if [ -n "$expected" ] && [ "$expected" != "-" ] && [ "$tok" = "$expected" ]; then
+          rm -rf "$aside" 2>/dev/null || true
+          rm -f "$intent" 2>/dev/null || true
+          continue
+        fi
+        if [ "$force" = "true" ]; then
+          rm -rf "$aside" 2>/dev/null || true
+          rm -f "$intent" 2>/dev/null || true
+          continue
+        fi
+        if restore_aside "$aside"; then
+          rm -f "$intent" 2>/dev/null || true
+          echo "WARNING: restored live lease (task '$2') parked in release aside." >&2
+        else
+          echo "Error: live lease (task '$2') is parked in release aside ${aside##*/}; treating lock as held." >&2
+        fi
+        return 3
+      fi
+    fi
+    rm -rf "$aside" 2>/dev/null || true
+    rm -f "$intent" 2>/dev/null || true
+  done
+
+  # 3. Takeover asides normally hold a verified-stale lease, but a raced
+  #    takeover can park a live replacement lease here. Same rule.
+  for aside in "$STALE_PREFIX".*; do
+    [ -d "$aside" ] || continue
+    if holder=$(read_info_at "$aside/info"); then
+      # shellcheck disable=SC2086
+      set -- $holder
+      since="$3"; hb="${4:-}"
+      if ! lock_is_stale "$since" "$hb"; then
+        if restore_aside "$aside"; then
+          echo "WARNING: restored live lease (task '$2') parked in takeover aside." >&2
+        else
+          echo "Error: live lease (task '$2') is parked in takeover aside ${aside##*/}; treating lock as held." >&2
+        fi
+        return 3
+      fi
+    fi
+    rm -rf "$aside" 2>/dev/null || true
+  done
+  return 0
+}
+
 do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_TOKEN
   # Takeover is decided by ONE atomic step: renaming the observed-stale lock
   # dir aside. Exactly one concurrent thief wins the rename; losers re-read
@@ -225,16 +390,18 @@ do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_T
   ACQUIRED_MODE=""
   ACQUIRED_TOKEN=""
   mkdir -p "$MAIN_ROOT/.powerflow"
-  # Discard takeovers and releases orphaned by a crash between rename and cleanup.
-  # Asides are never read back, so deleting them cannot affect a live lease.
-  rm -rf "$MAIN_ROOT"/.powerflow/.integration-lock.stale.* "$MAIN_ROOT"/.powerflow/.integration-lock.rel.* 2>/dev/null || true
   local attempt holder pid task since hb tok eff aside moved_tokens
-  local absent_seen=0
   for attempt in 1 2 3 4 5 6 7 8; do
+    # Recover asides left by a crashed takeover/release. A fresh release
+    # intent makes us wait instead of creating a lock in the recovery gap; a
+    # fresh lease parked in an aside is restored, never deleted.
+    if ! recover_asides; then
+      sleep 0.2
+      continue
+    fi
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-      # Dir was absent: free lock (or a takeover gap someone must fill).
-      # A takeover gap is filled ONLY here or via adopt below — never by
-      # resetting an existing dir.
+      # Dir was absent: free lock (or a takeover/restore gap someone must
+      # fill). mkdir is the only election; an existing dir is never reset.
       ACQUIRED_TOKEN=$(new_token)
       if write_info "$$" "$TASK" "$(now_s)" "$ACQUIRED_TOKEN"; then
         ACQUIRED_MODE="fresh"
@@ -308,55 +475,18 @@ do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_T
       continue
     fi
     if [ -e "$LOCK_DIR" ]; then
-      # Dir exists but info unreadable (mid-write/mid-takeover): wait out
-      # the transient, never reset blindly.
-      absent_seen=0
+      # Dir exists but info unreadable (mid-write/mid-takeover/mid-restore):
+      # wait out the transient, never reset blindly.
       sleep 0.2
       continue
     fi
-    # Dir absent and unreadable: a takeover is in flight (winner between
-    # rename and re-create). Adopt the orphaned aside ONLY if exactly one
-    # exists and it still verifies stale right now — the atomic mv-back
-    # elects a single adopter.
-    absent_seen=$((absent_seen + 1))
-    if [ "$absent_seen" -ge 3 ]; then
-      aside=$(adopt_stale_aside) && {
-        ACQUIRED_TOKEN=$(new_token)
-        if write_info "$$" "$TASK" "$(now_s)" "$ACQUIRED_TOKEN"; then
-          ACQUIRED_MODE="stale-adopted"
-          return 0
-        fi
-        echo "Error: cannot write lock info." >&2
-        return 1
-      }
-    fi
+    # Dir absent with no readable info: a takeover or restore is in flight.
+    # The next iteration's recover_asides + mkdir settles it — a stale aside
+    # is cleaned and a live parked lease is restored — so just wait.
     sleep 0.2
   done
   echo "Error: integration lock unsettled after retries — treating as held. If no integrator is running, an operator may 'release --force'." >&2
   return 3
-}
-
-adopt_stale_aside() { # adopt_stale_aside -> prints adopted dir, or fails
-  # Single-orphan adoption: exactly one stale aside whose lease still
-  # verifies stale NOW is moved back as the lock dir (atomic election —
-  # concurrent adopters: one wins). Caller rewrites it as its own lease.
-  local asides aside info_holder since hb
-  asides=$(printf '%s\n' "$MAIN_ROOT"/.powerflow/.integration-lock.stale.* 2>/dev/null | grep -v '\*' || true)
-  [ -n "$asides" ] || return 1
-  [ "$(printf '%s\n' "$asides" | wc -l)" -eq 1 ] || return 1
-  aside="$asides"
-  info_holder=$(read_info_at "$aside/info") || return 1
-  # shellcheck disable=SC2086
-  set -- $info_holder
-  since="$3"; hb="${4:-}"
-  lock_is_stale "$since" "$hb" || return 1
-  # Adopt only onto an absent target (never move the orphan INSIDE a live
-  # dir — that would strand it with no top-level info). Residual microsecond
-  # race here fails LOUD (unreadable lock → everyone reports held) rather
-  # than admitting two owners.
-  [ -e "$LOCK_DIR" ] && return 1
-  mv "$aside" "$LOCK_DIR" 2>/dev/null || return 1
-  printf '%s' "$LOCK_DIR"
 }
 
 do_heartbeat() { # do_heartbeat -> 0 refreshed, 1 mismatch/gone
@@ -427,6 +557,11 @@ do_release() { # do_release -> 0 released/already-free, 1 mismatch
   # check and deletion), the lock dir is atomically renamed aside first.
   # If the moved lease's token does not match, it is restored and release
   # is refused with exit 1 without harming the replacement lease.
+  #
+  # The release intent is published BEFORE the rename. It tells concurrent
+  # acquires that this aside is an active release workspace: they wait while
+  # it is fresh instead of filling the gap or cleaning the aside, and only a
+  # stale intent is recovered as a crashed release.
   local holder task tok
   if [ "$FORCE" = false ]; then
     if ! holder=$(lock_holder); then
@@ -447,18 +582,38 @@ do_release() { # do_release -> 0 released/already-free, 1 mismatch
     sleep "$POWERFLOW_TEST_PAUSE_RELEASE"
   fi
 
-  local rel_aside
-  rel_aside="$MAIN_ROOT/.powerflow/.integration-lock.rel.$$"
+  local rel_aside rel_intent rel_intent_tmp
+  rel_aside="$REL_PREFIX.$$"
+  rel_intent="$rel_aside.intent"
+  rel_intent_tmp="$MAIN_ROOT/.powerflow/.rel-intent.$$"
   rm -rf "$rel_aside" 2>/dev/null || true
+  rm -f "$rel_intent" "$rel_intent_tmp" 2>/dev/null || true
+
+  # Publish the intent BEFORE moving: concurrent acquires must see that this
+  # aside is an active release workspace, not an orphan to clean. Written via
+  # tmp+mv so readers never observe a partial record.
+  if ! printf 'PID=%s\nSINCE=%s\nWINDOW=%s\nTOKEN=%s\nFORCE=%s\n' "$$" "$(now_s)" "$STALE_AFTER" "${TOKEN_REQ:--}" "$FORCE" > "$rel_intent_tmp" \
+     || ! mv -f "$rel_intent_tmp" "$rel_intent" 2>/dev/null; then
+    rm -f "$rel_intent_tmp" 2>/dev/null || true
+    echo "Error: cannot record release intent." >&2
+    return 1
+  fi
 
   if ! mv "$LOCK_DIR" "$rel_aside" 2>/dev/null; then
     # Could not move: either already freed, or another process moved it.
+    rm -f "$rel_intent" 2>/dev/null || true
     if [ ! -e "$LOCK_DIR" ]; then
       echo "Integration lock already free." >&2
       return 0
     fi
     echo "Error: integration lock unsettled during release." >&2
     return 1
+  fi
+
+  # Test seam: pause after the move, before token verification, so a test can
+  # run a concurrent acquire exactly in the recovery gap.
+  if [[ "${POWERFLOW_TEST_PAUSE_RELEASE_AFTER_MOVE:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_TEST_PAUSE_RELEASE_AFTER_MOVE:-0}" -gt 0 ]; then
+    sleep "$POWERFLOW_TEST_PAUSE_RELEASE_AFTER_MOVE"
   fi
 
   # Verify-after-move: check what was actually moved aside
@@ -470,23 +625,27 @@ do_release() { # do_release -> 0 released/already-free, 1 mismatch
       moved_task="$2"; moved_tok="${5:-}"
       if [ "$moved_task" != "$TASK" ] || [ "$moved_tok" != "$TOKEN_REQ" ]; then
         echo "WARNING: release raced a replacement lease — restoring and refusing release." >&2
-        if [ ! -e "$LOCK_DIR" ]; then
-          mv "$rel_aside" "$LOCK_DIR" 2>/dev/null || true
+        if restore_aside "$rel_aside"; then
+          echo "Error: lease owned by task '$moved_task' (token ${moved_tok:-none}) — release token does not match. Use --force to break it." >&2
+        else
+          echo "Error: cannot restore displaced lease; left parked in ${rel_aside##*/}. Use --force to break it." >&2
         fi
-        echo "Error: lease owned by task '$moved_task' (token ${moved_tok:-none}) — release token does not match. Use --force to break it." >&2
+        rm -f "$rel_intent" 2>/dev/null || true
         return 1
       fi
     else
-      # Info unreadable in moved dir and not force: restore and refuse
-      if [ ! -e "$LOCK_DIR" ]; then
-        mv "$rel_aside" "$LOCK_DIR" 2>/dev/null || true
-      fi
-      echo "Error: cannot verify lease in releasing dir; restored." >&2
+      # Info unreadable in the moved dir: never delete what we cannot verify.
+      echo "Error: cannot verify lease in releasing dir; left parked in ${rel_aside##*/}." >&2
+      rm -f "$rel_intent" 2>/dev/null || true
       return 1
     fi
   fi
 
+  # Complete the release: drop the aside first, then the intent. A crash in
+  # between leaves a fresh intent with no aside, which acquire waits out (it
+  # times out like any stale lease) rather than risking a live lease.
   rm -rf "$rel_aside"
+  rm -f "$rel_intent" 2>/dev/null || true
   echo "Integration lock released (was task '$TASK')." >&2
   return 0
 }
@@ -534,6 +693,12 @@ case "$CMD" in
         [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=held\nHOLDER_TASK=%s\nHOLDER_AGE_S=%s\nHOLDER_TOKEN=%s\n' "$2" "$AGE" "${5:-}"
         echo "Integration lock held by task '$2' (last refresh ${AGE}s ago)." >&2
       fi
+    elif has_fresh_intent; then
+      # The lock dir is absent because a release moved it aside and is still
+      # working (or paused). Do not report a plain free lock while acquire
+      # would wait for that release to finish.
+      [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=free\nRELEASE=in-progress\n'
+      echo "Integration lock free but a release is in progress; acquire will wait." >&2
     else
       [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=free\n'
       echo "Integration lock free." >&2
