@@ -105,4 +105,39 @@ assert_exit "lock-run-held" 3 "$CODE"
 [ ! -e "$TMP/SHOULD_NOT_EXIST" ] && pass "lock-run-child-skipped" || fail "lock-run-child-skipped" "child ran while locked"
 rm -rf "$TMP"; trap - EXIT
 
+# 6. Token ownership: acquire mints a token, heartbeat preserves it, and a
+#    heartbeat for a task that lost the lease refuses instead of clobbering.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --porcelain 2>/dev/null); CODE=$?
+assert_exit "lock-token-acquire" 0 "$CODE"
+TOK1=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+[ -n "$TOK1" ] && pass "lock-token-minted" || fail "lock-token-minted" "no TOKEN in acquire porcelain"
+(cd "$TMP" && bash "$LOCK" heartbeat --task aaa >/dev/null 2>&1); CODE=$?
+assert_exit "lock-token-hb" 0 "$CODE"
+TOK2=$(grep '^TOKEN=' "$TMP/.powerflow/.integration-lock/info" | cut -d= -f2)
+[ "$TOK2" = "$TOK1" ] && pass "lock-token-stable" || fail "lock-token-stable" "heartbeat changed token $TOK1 -> $TOK2"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-token-status" "$OUT" "^HOLDER_TOKEN=$TOK1$"
+# Simulate a steal without rename (direct rewrite, as a racing writer would):
+# the old owner's heartbeat must refuse, and the lease must stay intact.
+printf 'PID=9\nTASK=bbb\nSINCE=%s\nHEARTBEAT=%s\nTOKEN=tok-bbb\n' "$(date +%s)" "$(date +%s)" > "$TMP/.powerflow/.integration-lock/info"
+(cd "$TMP" && bash "$LOCK" heartbeat --task aaa >/dev/null 2>&1); CODE=$?
+assert_exit "lock-token-hb-refused" 1 "$CODE"
+[ "$(grep '^TASK=' "$TMP/.powerflow/.integration-lock/info" | cut -d= -f2)" = "bbb" ] && pass "lock-token-no-clobber" || fail "lock-token-no-clobber" "heartbeat overwrote another lease"
+rm -rf "$TMP"; trap - EXIT
+
+# 7. Concurrent steal storm: N simultaneous thieves elect EXACTLY one winner.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/.powerflow/.integration-lock"
+printf 'PID=1\nTASK=old\nSINCE=1\nHEARTBEAT=1\nTOKEN=tok-old\n' > "$TMP/.powerflow/.integration-lock/info"
+rm -f "$TMP/race.out"
+for i in 1 2 3 4 5 6; do
+  (cd "$TMP" && bash "$LOCK" acquire --task "thief$i" --stale-after 100 >/dev/null 2>&1; echo "$? thief$i" >> "$TMP/race.out") &
+done
+wait
+[ "$(grep -c '^0 ' "$TMP/race.out")" -eq 1 ] && pass "lock-storm-single-winner" || fail "lock-storm-single-winner" "$(cat "$TMP/race.out" | tr '\n' ' ')"
+[ "$(grep -c '^3 ' "$TMP/race.out")" -eq 5 ] && pass "lock-storm-losers-backoff" || fail "lock-storm-losers-backoff" "losers did not all get exit 3"
+ls "$TMP/.powerflow/" | grep -q stale && fail "lock-storm-leftovers" "stale aside dirs remain" || pass "lock-storm-leftovers"
+rm -rf "$TMP"; trap - EXIT
+
 summary_of

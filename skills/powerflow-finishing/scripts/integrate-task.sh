@@ -10,10 +10,17 @@ set -euo pipefail
 # assumed safe once combined. On any failure the task branch AND worktree are
 # kept for recovery; cleanup happens only after verification passes.
 #
-# Flow: acquire lock -> pre-checks -> preflight evidence gate -> resolve
-# integration branch -> locate the owning worktree (<loc>) -> sync (ff-only
-# pull) -> stale/diverged gate -> overlap advisory -> merge -> verify ->
-# cleanup worktree+branch -> release.
+# Flow: acquire lock (lease TOKEN) -> heartbeat lease for the whole run ->
+# pre-checks -> preflight evidence gate -> resolve integration branch ->
+# locate the owning worktree (<loc>) -> assert lease -> sync (ff-only pull)
+# -> stale/diverged gate -> overlap advisory -> assert lease -> merge ->
+# verify -> cleanup worktree+branch (task-owned resources, ungated) ->
+# release.
+#
+# Losing the lease aborts with exit 6 BEFORE any further shared mutation
+# (sync pull, merge) — a failed heartbeat is recorded, never swallowed, and
+# the live token is re-verified at each gate. Cleanup touches only
+# task-owned resources, so it stays safe to finish after post-merge work.
 #
 # The orchestrator records decisions in summary.md (this script writes nothing
 # there); the script appends machine-readable verification blocks to
@@ -40,9 +47,11 @@ set -euo pipefail
 # Exit codes: 0 integrated+verified | 1 error (incl. cleanup-after-merge
 #   failure — the merge itself is recorded) | 2 usage, not a git repo, or
 #   unreadable summary | 3 integration lock held | 4 needs attention
-#   (stale/diverged base, no-upstream sync, merge conflict — all state kept) |
-#   5 post-merge verification FAILED (merged result kept in place for
-#   fix-forward or manual reset — branch and worktree are NOT deleted).
+#   (preflight evidence, stale/diverged base, no-upstream sync, merge
+#   conflict — all state kept) | 5 post-merge verification FAILED (merged
+#   result kept in place for fix-forward or guarded reset — branch and
+#   worktree are NOT deleted) | 6 integration lease lost mid-run (aborted
+#   before further shared mutation — all state kept, re-queue the task).
 
 TASK_DIR=""
 ALLOW_STALE_BASE=false
@@ -94,6 +103,9 @@ esac
 SUMMARY="$TASK_DIR_ABS/summary.md"
 [ -f "$SUMMARY" ] || { echo "Error: summary.md not found at $SUMMARY" >&2; exit 2; }
 TASK_SLUG=$(basename "$TASK_DIR_ABS")
+# Executions dir up front: the lease-loss flag must be writable from the
+# moment the heartbeat starts (long before the merge log is opened).
+mkdir -p "$TASK_DIR_ABS/executions"
 
 field_of() { # field_of <label> -> value or empty (reads $SUMMARY)
   grep -Ei -m1 "^[*-][[:space:]]+$1:" "$SUMMARY" 2>/dev/null \
@@ -147,20 +159,43 @@ heartbeat_every() {
   [ "$want" -lt "$third" ] && printf '%s' "$want" || printf '%s' "$third"
 }
 # NOTE: no `!` here — `$?` after `! cmd` is the negated status (always 0).
-bash "$LOCK_SH" acquire --task "$TASK_SLUG" --stale-after "$STALE_AFTER" >&2
+# Stdout (porcelain) is captured for the lease TOKEN; human messages on
+# stderr flow through untouched.
+ACQ_OUT=$(bash "$LOCK_SH" acquire --task "$TASK_SLUG" --stale-after "$STALE_AFTER" --porcelain)
 CODE=$?
 if [ "$CODE" -ne 0 ]; then
   LOCK_HELD=false
   trap - EXIT
   exit "$CODE"  # 3 held, 1 race/error
 fi
+LEASE_TOKEN=$(printf '%s' "$ACQ_OUT" | grep '^TOKEN=' | cut -d= -f2 || true)
+[ -n "$LEASE_TOKEN" ] || fail "acquire succeeded but returned no lease token"
 LOCK_HELD=true
+# Lease-loss detection: the heartbeat NEVER swallows failures — any failed
+# refresh plants LEASE_LOST, and assert_lease re-verifies the live token
+# before every shared mutation (sync pull, merge). Losing the lease aborts
+# with exit 6 (state kept, re-queue) instead of merging blind.
+LEASE_LOST="$TASK_DIR_ABS/executions/.lease-lost"
+rm -f "$LEASE_LOST"
 EVERY=$(heartbeat_every)
 ( while true; do
     sleep "$EVERY"
-    bash "$LOCK_SH" heartbeat --task "$TASK_SLUG" >/dev/null 2>&1 || true
+    bash "$LOCK_SH" heartbeat --task "$TASK_SLUG" >/dev/null 2>&1 || touch "$LEASE_LOST"
   done ) &
 HEART_PID_INT=$!
+
+assert_lease() { # assert_lease <what> — exit 6 unless OUR token still holds
+  local cur=""
+  if [ -f "$LEASE_LOST" ]; then
+    echo "Error: integration lease lost (heartbeat failed) before $1 — another integrator may hold the queue. All state kept; re-queue this task." >&2
+    exit 6
+  fi
+  cur=$(bash "$LOCK_SH" status --porcelain 2>/dev/null | grep '^HOLDER_TOKEN=' | cut -d= -f2 || true)
+  if [ "$cur" != "$LEASE_TOKEN" ]; then
+    echo "Error: integration lease lost before $1 (holder token changed) — another integrator may hold the queue. All state kept; re-queue this task." >&2
+    exit 6
+  fi
+}
 
 fail() { echo "Error: $1" >&2; exit "${2:-1}"; }
 
@@ -183,21 +218,34 @@ TASK_HEAD=$(git rev-parse --verify --quiet "$TASK_BRANCH") || fail "cannot resol
 # preflight (Tier 1+2 at HEAD, Tier 3 or Small-waiver, clean tree, on the task
 # branch) BEFORE it may enter the shared branch. Runs in the task worktree so
 # HEAD/SHA checks evaluate the task checkout, not the caller's. Legacy
-# branch-mode tasks without a live worktree cannot be gated here — they
-# proceed with a warning (the orchestrator ran the gates manually).
-# --skip-preflight is an explicit, logged escape hatch for extraordinary cases.
+# branch-mode tasks without a live worktree run it in the CURRENT checkout —
+# but only when that checkout actually holds the task branch (the validator
+# re-checks branch and cleanliness itself). Anything else refuses: evidence
+# that cannot be verified stops the queue, and only --skip-preflight proceeds
+# explicitly (logged).
 VALIDATE_SH="$SCRIPT_DIR/../../using-powerflow/scripts/validate-transition.sh"
-if [ "$SKIP_PREFLIGHT" = true ]; then
-  echo "WARNING: --skip-preflight given; pre-integration evidence NOT checked." >&2
-elif [ "$WT_ACTIVE" = true ]; then
-  PREFLIGHT_OUT=$(cd "$WT_PATH" && bash "$VALIDATE_SH" --task-dir "$TASK_DIR_ABS" --preflight 2>&1) || {
+run_preflight_in() { # run_preflight_in <dir> — exit 4 unless the gate passes
+  PREFLIGHT_OUT=$(cd "$1" && bash "$VALIDATE_SH" --task-dir "$TASK_DIR_ABS" --preflight 2>&1) || {
     echo "Error: pre-integration preflight FAILED for $TASK_BRANCH at $TASK_HEAD — run the missing tiers (or record a Tier 3 waiver for Small tasks) before queueing:" >&2
     printf '%s\n' "$PREFLIGHT_OUT" >&2
     exit 4
   }
   echo "Preflight passed for $TASK_BRANCH at ${TASK_HEAD:0:7}." >&2
+}
+if [ "$SKIP_PREFLIGHT" = true ]; then
+  echo "WARNING: --skip-preflight given; pre-integration evidence NOT checked." >&2
+elif [ "$WT_ACTIVE" = true ]; then
+  run_preflight_in "$WT_PATH"
 else
-  echo "Note: no live task worktree — preflight gate skipped (branch mode); ensure validate-transition.sh --preflight passed manually." >&2
+  HERE_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "UNKNOWN")
+  if [ "$HERE_BRANCH" = "$TASK_BRANCH" ]; then
+    echo "Note: no live task worktree; running preflight in current checkout ($HERE_BRANCH)." >&2
+    run_preflight_in "$PWD"
+  else
+    echo "Error: no live task worktree and current checkout is on '$HERE_BRANCH', not task branch '$TASK_BRANCH' — preflight evidence cannot be verified." >&2
+    echo "Re-run from the task checkout, or pass --skip-preflight to proceed explicitly (logged)." >&2
+    exit 4
+  fi
 fi
 
 # --- resolve integration branch + locate owning worktree (<loc>) ----------------
@@ -226,6 +274,7 @@ else
 fi
 
 # --- sync the integration branch ------------------------------------------------
+assert_lease "syncing the integration branch"
 if [ "$OFFLINE" = true ]; then
   echo "Note: offline mode — skipping pull (explicit decision)." >&2
 else
@@ -268,6 +317,16 @@ if [ "$OVERLAP" != "none" ]; then
 fi
 
 # --- merge -----------------------------------------------------------------------
+# POWERFLOW_PRE_MERGE_PAUSE (seconds, default 0) stalls here before the
+# lease gate — a TEST seam so lease-loss timing is deterministic (the
+# suite silences the heartbeat and steals mid-pause). Never set it in
+# real runs; it only widens the steal window.
+if [[ "${POWERFLOW_PRE_MERGE_PAUSE:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_PRE_MERGE_PAUSE:-0}" -gt 0 ]; then
+  sleep "$POWERFLOW_PRE_MERGE_PAUSE"
+fi
+# Final ownership check immediately before the shared mutation: even with
+# heartbeats, a steal in the preceding gap must stop us HERE, not during.
+assert_lease "merging into the integration branch"
 MERGED_VIA=""
 if git -C "$LOC" merge --ff-only "$TASK_BRANCH" >/dev/null 2>&1; then
   MERGED_VIA="ff-only"

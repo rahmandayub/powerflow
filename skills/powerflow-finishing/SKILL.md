@@ -342,11 +342,19 @@ Rules (enforced by the script, same spirit as Sections 2–7):
    After success, record the choice, `MERGE_SHA`, and verification result in
    `summary.md` (Closeout) and free the slot for the next queued task.
 7. **Preflight evidence is mandatory.** The script runs
-   `validate-transition.sh --preflight` in the task worktree before merging:
+   `validate-transition.sh --preflight` in the task worktree before merging
+   (legacy branch-mode tasks: in the current checkout, but only when it
+   holds the task branch — otherwise refused, exit 4):
    Tier 1+2 PASS at the task HEAD, Tier 3 (or a Small-task waiver), clean
    tree, on the task branch. `--verify-command true` alone proves nothing
    about pre-merge evidence and is rejected without it (exit 4);
    `--skip-preflight` bypasses explicitly and is logged.
+8. **Lease loss stops the run.** The heartbeat never swallows failures and
+   the live lease token is re-verified before the sync pull and the merge:
+   losing the queue mid-run aborts with exit 6 (state kept, re-queue) instead
+   of merging blind. Takeover itself is a single atomic rename — concurrent
+   steal attempts elect exactly one winner — and a heartbeat that finds
+   another owner's token never touches the lease.
 8. **Stacked tasks** (started with `--base-sha` on an UNMERGED dependency's
    commit) integrate in dependency order: after the dependency merges, the
    stacked task's Base SHA is an ancestor of the integration branch, so it

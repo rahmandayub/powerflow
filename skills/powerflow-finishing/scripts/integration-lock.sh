@@ -6,16 +6,21 @@ set -euo pipefail
 # <main-root>/.powerflow/.integration-lock/ (portable, no flock needed).
 # Writes nothing outside that lock dir.
 #
-# The lock is a LEASE refreshed by heartbeat, not a plain timestamp:
+# The lock is a TOKEN lease refreshed by heartbeat, not a plain timestamp:
 # acquire/release are separate short-lived processes, so holder-PID liveness
 # cannot work (the acquirer's PID is dead the moment acquire exits). Instead
-# the live owner refreshes HEARTBEAT ("integration-lock.sh heartbeat" or the
-# `run`/`integrate-task.sh` loops) and only a lease with no refresh for
-# --stale-after seconds (default 1800) is stolen — a >30-minute integration
-# is never mistaken for a crash while its heartbeat runs. A crashed owner
-# stops heartbeating, so the queue still recovers. Prefer the `run`
-# subcommand: it holds the lock for exactly the lifetime of the child command
-# (with heartbeat) and always releases it.
+# each acquire mints a unique TOKEN, the live owner refreshes HEARTBEAT
+# ("integration-lock.sh heartbeat" or the `run`/`integrate-task.sh` loops),
+# and only a lease with no refresh for --stale-after seconds (default 1800)
+# is stolen — a >30-minute integration is never mistaken for a crash while
+# its heartbeat runs. A crashed owner stops heartbeating, so the queue still
+# recovers. Takeover is decided by ONE atomic step (renaming the stale lock
+# dir aside): exactly one concurrent thief wins; losers re-read and back off.
+# Owners prove ownership by TOKEN — a heartbeat or release that finds another
+# token never touches the lease, and an integrator that loses its token must
+# stop before any further shared mutation (see integrate-task.sh). Prefer the
+# `run` subcommand: it holds the lock for exactly the lifetime of the child
+# command (with heartbeat) and always releases it.
 #
 # Usage:
 #   integration-lock.sh acquire --task <slug> [--stale-after N] [--porcelain]
@@ -85,17 +90,26 @@ INFO="$LOCK_DIR/info"
 
 now_s() { date +%s; }
 
-lock_holder() { # lock_holder -> prints "PID TASK SINCE HEARTBEAT" or fails
-  # HEARTBEAT is empty for leases written before heartbeat existed; callers
-  # must read it as ${4:-} and fall back to SINCE.
-  local pid="" task="" since="" hb=""
+new_token() { # new_token -> unique owner identity for one acquire
+  # $$ + epoch + $RANDOM: unique per acquire on this host without date %N
+  # (not portable to BSD date). Recorded in the lease; owners prove
+  # ownership by token, never by PID (PIDs of acquire processes are
+  # short-lived) — so a late heartbeat can never be mistaken for the owner.
+  printf '%s-%s-%s' "$$" "$(date +%s)" "$RANDOM"
+}
+
+lock_holder() { # lock_holder -> prints "PID TASK SINCE HEARTBEAT TOKEN" or fails
+  # HEARTBEAT/TOKEN are empty for leases written before they existed;
+  # callers must read them as ${4:-}/${5:-} and fall back to SINCE.
+  local pid="" task="" since="" hb="" tok=""
   [ -f "$INFO" ] || return 1
   pid=$(grep -E '^PID=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
   task=$(grep -E '^TASK=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
   since=$(grep -E '^SINCE=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
   hb=$(grep -E '^HEARTBEAT=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
+  tok=$(grep -E '^TOKEN=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
   [ -n "$pid" ] && [ -n "$task" ] && [ -n "$since" ] || return 1
-  printf '%s %s %s %s' "$pid" "$task" "$since" "$hb"
+  printf '%s %s %s %s %s' "$pid" "$task" "$since" "$hb" "$tok"
 }
 
 freshest_ts() { # freshest_ts <since> [heartbeat] -> newest numeric ts or "unknown"
@@ -124,66 +138,196 @@ lock_is_stale() { # lock_is_stale <since> [heartbeat] -> 0 when lease expired
   [ "$age" != "unknown" ] && [ "$age" -ge "$STALE_AFTER" ]
 }
 
-write_info() { # write_info <pid> <task> <since> — atomic via tmp+mv
+write_info() { # write_info <pid> <task> <since> <token> — atomic via tmp+mv
   local tmp
   tmp=$(mktemp "$LOCK_DIR/.tmp.XXXXXX" 2>/dev/null) || return 1
-  printf 'PID=%s\nTASK=%s\nSINCE=%s\nHEARTBEAT=%s\n' "$1" "$2" "$3" "$(now_s)" > "$tmp"
+  printf 'PID=%s\nTASK=%s\nSINCE=%s\nHEARTBEAT=%s\nTOKEN=%s\n' "$1" "$2" "$3" "$(now_s)" "$4" > "$tmp"
   mv -f "$tmp" "$INFO"
 }
 
-do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE
+read_info_at() { # read_info_at <infofile> -> "PID TASK SINCE HEARTBEAT TOKEN" or fails
+  local f="$1" pid="" task="" since="" hb="" tok=""
+  [ -f "$f" ] || return 1
+  pid=$(grep -E '^PID=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  task=$(grep -E '^TASK=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  since=$(grep -E '^SINCE=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  hb=$(grep -E '^HEARTBEAT=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  tok=$(grep -E '^TOKEN=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  [ -n "$pid" ] && [ -n "$task" ] && [ -n "$since" ] || return 1
+  printf '%s %s %s %s %s' "$pid" "$task" "$since" "$hb" "$tok"
+}
+
+do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_TOKEN
+  # Takeover is decided by ONE atomic step: renaming the observed-stale lock
+  # dir aside. Exactly one concurrent thief wins the rename; losers re-read
+  # and back off. A late heartbeat from the old owner writes into the
+  # detached aside dir — never into the new lease.
+  #
+  # Staleness is evaluated on data read BEFORE the rename, but the rename
+  # moves WHATEVER exists at rename time — so after winning, the mover MUST
+  # verify the aside copy still carries the observed token. If a full steal
+  # cycle by someone else slipped into the microsecond gap, the aside holds
+  # THEIR live lease: put it back and back off instead of destroying it.
+  #
+  # Ambiguity rule: an existing-but-unreadable lock dir is NEVER reset
+  # blindly (a takeover may be in flight — resetting deleted a live lock in
+  # testing). Only mkdir-winners write; mkdir is attempted solely when the
+  # dir is believed absent (initial try, post-own-rename, adopted orphan).
+  # Unsettled states retry briefly, then report held; a genuinely orphaned
+  # dir needs an operator `release --force`.
   ACQUIRED_MODE=""
+  ACQUIRED_TOKEN=""
   mkdir -p "$MAIN_ROOT/.powerflow"
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
-    write_info "$$" "$TASK" "$(now_s)" || { rm -rf "$LOCK_DIR"; echo "Error: cannot write lock info." >&2; return 1; }
-    ACQUIRED_MODE="fresh"
-    return 0
-  fi
-  local holder pid task since hb eff
-  if holder=$(lock_holder); then
-    # shellcheck disable=SC2086
-    set -- $holder
-    pid="$1"; task="$2"; since="$3"; hb="${4:-}"
-    eff=$(freshest_ts "$since" "$hb")
-    if lock_is_stale "$since" "$hb"; then
-      echo "WARNING: stealing stale integration lock (task '$task', no refresh for $(lock_age "$eff")s >= ${STALE_AFTER}s)." >&2
-      rm -rf "$LOCK_DIR"
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        write_info "$$" "$TASK" "$(now_s)" || { rm -rf "$LOCK_DIR"; echo "Error: cannot write lock info." >&2; return 1; }
-        ACQUIRED_MODE="stale"
+  # Discard takeovers orphaned by a crash between rename and cleanup. Asides
+  # are never read back, so deleting them cannot affect a live lease.
+  rm -rf "$MAIN_ROOT"/.powerflow/.integration-lock.stale.* 2>/dev/null || true
+  local attempt holder pid task since hb tok eff aside moved_tokens
+  local absent_seen=0
+  for attempt in 1 2 3 4 5 6 7 8; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      # Dir was absent: free lock (or a takeover gap someone must fill).
+      # A takeover gap is filled ONLY here or via adopt below — never by
+      # resetting an existing dir.
+      ACQUIRED_TOKEN=$(new_token)
+      if write_info "$$" "$TASK" "$(now_s)" "$ACQUIRED_TOKEN"; then
+        ACQUIRED_MODE="fresh"
         return 0
       fi
-      echo "Error: cannot acquire integration lock (race lost)." >&2
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      echo "Error: cannot write lock info." >&2
       return 1
     fi
-    echo "Error: integration lock held by task '$task' (last refresh $(lock_age "$eff")s ago). Wait for it to finish." >&2
-    return 3
-  fi
-  # Lock dir exists but unreadable/empty (crashed mid-acquire): reset it.
-  echo "WARNING: integration lock dir exists without holder info; resetting." >&2
-  rm -rf "$LOCK_DIR"
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
-    write_info "$$" "$TASK" "$(now_s)" || { rm -rf "$LOCK_DIR"; echo "Error: cannot write lock info." >&2; return 1; }
-    ACQUIRED_MODE="reset"
-    return 0
-  fi
-  echo "Error: cannot acquire integration lock (race lost)." >&2
-  return 1
+    if holder=$(lock_holder); then
+      absent_seen=0
+      # shellcheck disable=SC2086
+      set -- $holder
+      pid="$1"; task="$2"; since="$3"; hb="${4:-}"; tok="${5:-}"
+      eff=$(freshest_ts "$since" "$hb")
+      if ! lock_is_stale "$since" "$hb"; then
+        echo "Error: integration lock held by task '$task' (last refresh $(lock_age "$eff")s ago). Wait for it to finish." >&2
+        return 3
+      fi
+      echo "WARNING: stealing stale integration lock (task '$task', no refresh for $(lock_age "$eff")s >= ${STALE_AFTER}s)." >&2
+      aside="$MAIN_ROOT/.powerflow/.integration-lock.stale.$$"
+      rm -rf "$aside" 2>/dev/null || true
+      if ! mv "$LOCK_DIR" "$aside" 2>/dev/null; then
+        # Rename lost: another thief is mid-takeover, or the owner is
+        # writing. Re-read on the next attempt instead of deciding now.
+        sleep 0.2
+        continue
+      fi
+      # Verify-after-move: the rename moves whatever exists NOW, but our
+      # stale verdict came from an EARLIER read. If a full steal cycle by
+      # someone else slipped into the gap, the aside holds THEIR live
+      # lease — put it back untouched and back off.
+      moved_tokens=""
+      if moved_holder=$(read_info_at "$aside/info"); then
+        # shellcheck disable=SC2086
+        set -- $moved_holder
+        moved_tokens="${5:-}"
+      fi
+      if [ -n "$tok" ] && [ "$moved_tokens" != "$tok" ]; then
+        echo "WARNING: takeover raced a replacement (aside token mismatch) — restoring and backing off." >&2
+        # Restore only onto an absent target: moving the aside INSIDE a live
+        # third-party dir would strand it (their top-level info stays
+        # intact, so they keep working — but don't do that on purpose).
+        if [ ! -e "$LOCK_DIR" ] && mv "$aside" "$LOCK_DIR" 2>/dev/null; then
+          echo "Error: integration lock changed hands during takeover; backing off." >&2
+          return 3
+        fi
+        # Restore failed (third party created the dir meanwhile): the aside
+        # may hold their live lease — leave it for pre-clean; their own
+        # token gates protect them. Never delete it here.
+        echo "Error: integration lock changed hands during takeover; backing off." >&2
+        return 3
+      fi
+      if mkdir "$LOCK_DIR" 2>/dev/null; then
+        ACQUIRED_TOKEN=$(new_token)
+        if write_info "$$" "$TASK" "$(now_s)" "$ACQUIRED_TOKEN"; then
+          rm -rf "$aside" || true
+          ACQUIRED_MODE="stale"
+          return 0
+        fi
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        echo "Error: cannot write lock info." >&2
+        return 1
+      fi
+      # Our rename won but the fresh mkdir lost: a new arrival's initial
+      # mkdir landed in the gap and legitimately holds a fresh lease (they
+      # found no dir). Our aside copy is the verified-stale lease — drop
+      # it and re-read instead of guessing.
+      rm -rf "$aside" || true
+      sleep 0.2
+      continue
+    fi
+    if [ -e "$LOCK_DIR" ]; then
+      # Dir exists but info unreadable (mid-write/mid-takeover): wait out
+      # the transient, never reset blindly.
+      absent_seen=0
+      sleep 0.2
+      continue
+    fi
+    # Dir absent and unreadable: a takeover is in flight (winner between
+    # rename and re-create). Adopt the orphaned aside ONLY if exactly one
+    # exists and it still verifies stale right now — the atomic mv-back
+    # elects a single adopter.
+    absent_seen=$((absent_seen + 1))
+    if [ "$absent_seen" -ge 3 ]; then
+      aside=$(adopt_stale_aside) && {
+        ACQUIRED_TOKEN=$(new_token)
+        if write_info "$$" "$TASK" "$(now_s)" "$ACQUIRED_TOKEN"; then
+          ACQUIRED_MODE="stale-adopted"
+          return 0
+        fi
+        echo "Error: cannot write lock info." >&2
+        return 1
+      }
+    fi
+    sleep 0.2
+  done
+  echo "Error: integration lock unsettled after retries — treating as held. If no integrator is running, an operator may 'release --force'." >&2
+  return 3
+}
+
+adopt_stale_aside() { # adopt_stale_aside -> prints adopted dir, or fails
+  # Single-orphan adoption: exactly one stale aside whose lease still
+  # verifies stale NOW is moved back as the lock dir (atomic election —
+  # concurrent adopters: one wins). Caller rewrites it as its own lease.
+  local asides aside info_holder since hb
+  asides=$(printf '%s\n' "$MAIN_ROOT"/.powerflow/.integration-lock.stale.* 2>/dev/null | grep -v '\*' || true)
+  [ -n "$asides" ] || return 1
+  [ "$(printf '%s\n' "$asides" | wc -l)" -eq 1 ] || return 1
+  aside="$asides"
+  info_holder=$(read_info_at "$aside/info") || return 1
+  # shellcheck disable=SC2086
+  set -- $info_holder
+  since="$3"; hb="${4:-}"
+  lock_is_stale "$since" "$hb" || return 1
+  # Adopt only onto an absent target (never move the orphan INSIDE a live
+  # dir — that would strand it with no top-level info). Residual microsecond
+  # race here fails LOUD (unreadable lock → everyone reports held) rather
+  # than admitting two owners.
+  [ -e "$LOCK_DIR" ] && return 1
+  mv "$aside" "$LOCK_DIR" 2>/dev/null || return 1
+  printf '%s' "$LOCK_DIR"
 }
 
 do_heartbeat() { # do_heartbeat -> 0 refreshed, 1 held-by-other/gone
-  # Refreshes the lease ONLY when this task still owns it — never clobbers
-  # another task's lock (e.g. after a legitimate steal).
-  local holder task since hb pid
+  # Refreshes the lease ONLY when this task still owns it — the token is
+  # preserved, and another task's lease is never clobbered (e.g. after a
+  # legitimate steal). A heartbeat racing a takeover either lands in the
+  # detached aside dir (harmless) or fails — both surface as non-zero, which
+  # the owner must treat as lease loss, never ignore.
+  local holder task since hb pid tok
   holder=$(lock_holder) || { echo "Error: no integration lock to refresh." >&2; return 1; }
   # shellcheck disable=SC2086
   set -- $holder
-  pid="$1"; task="$2"; since="$3"; hb="${4:-}"
+  pid="$1"; task="$2"; since="$3"; hb="${4:-}"; tok="${5:-}"
   if [ "$task" != "$TASK" ]; then
     echo "Error: lock held by task '$task', not '$TASK' — not refreshing." >&2
     return 1
   fi
-  write_info "$pid" "$task" "$since" || { echo "Error: cannot refresh lock." >&2; return 1; }
+  write_info "$pid" "$task" "$since" "$tok" || { echo "Error: cannot refresh lock." >&2; return 1; }
   return 0
 }
 
@@ -242,10 +386,10 @@ case "$CMD" in
       EFF=$(freshest_ts "$3" "${4:-}")
       AGE=$(lock_age "$EFF")
       if lock_is_stale "$3" "${4:-}"; then
-        [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=stale\nHOLDER_TASK=%s\nHOLDER_AGE_S=%s\n' "$2" "$AGE"
+        [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=stale\nHOLDER_TASK=%s\nHOLDER_AGE_S=%s\nHOLDER_TOKEN=%s\n' "$2" "$AGE" "${5:-}"
         echo "Integration lock STALE (task '$2', no refresh for ${AGE}s). Next acquire will steal it." >&2
       else
-        [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=held\nHOLDER_TASK=%s\nHOLDER_AGE_S=%s\n' "$2" "$AGE"
+        [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=held\nHOLDER_TASK=%s\nHOLDER_AGE_S=%s\nHOLDER_TOKEN=%s\n' "$2" "$AGE" "${5:-}"
         echo "Integration lock held by task '$2' (last refresh ${AGE}s ago)." >&2
       fi
     else
@@ -265,7 +409,7 @@ case "$CMD" in
     ;;
   acquire)
     if do_acquire; then
-      [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=acquired\nHOLDER_TASK=%s\n' "$TASK"
+      [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=acquired\nHOLDER_TASK=%s\nTOKEN=%s\n' "$TASK" "$ACQUIRED_TOKEN"
       echo "Integration lock acquired for task '$TASK'." >&2
       exit 0
     else

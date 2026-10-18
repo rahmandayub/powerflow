@@ -85,6 +85,28 @@ assert_exit "integ-slow-done" 0 "$CODE"
 [ "$(git -C "$TMP" branch --list 'powerflow/*' | wc -l)" -eq 0 ] && pass "integ-slow-cleaned" || fail "integ-slow-cleaned" "slow integration did not finish cleanup"
 trap - EXIT; rm -rf "$TMP"
 
+# 1d. Lease lost pre-merge aborts with exit 6: heartbeat silenced, lease
+#     backdated + stolen during the pre-merge pause — no merge happens, all
+#     state is kept, and the thief's lock survives our exit (trap release
+#     never deletes another owner's lease).
+read -r TMP SLUG WT < <(make_integ_task); trap 'rm -rf "$TMP"' EXIT
+BEFORE=$(git -C "$TMP" rev-parse main)
+(cd "$TMP" && POWERFLOW_HEARTBEAT_INTERVAL=3600 POWERFLOW_PRE_MERGE_PAUSE=4 bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command true --offline --stale-after 2 >/dev/null 2>&1) &
+INTPID=$!
+sleep 1
+INFO="$TMP/.powerflow/.integration-lock/info"
+TOK_OURS=$(grep '^TOKEN=' "$INFO" | cut -d= -f2)
+printf 'PID=%s\nTASK=%s\nSINCE=1\nHEARTBEAT=1\nTOKEN=%s\n' "$$" "$SLUG" "$TOK_OURS" > "$INFO"
+(cd "$TMP" && bash "$LOCK" acquire --task thief --stale-after 2 >/dev/null 2>&1); CODE=$?
+assert_exit "integ-steal-setup" 0 "$CODE"
+wait "$INTPID"; CODE=$?
+assert_exit "integ-leaselost-exit" 6 "$CODE"
+[ "$(git -C "$TMP" rev-parse main)" = "$BEFORE" ] && pass "integ-leaselost-untouched" || fail "integ-leaselost-untouched" "main moved despite lost lease"
+git -C "$TMP" show-ref --verify --quiet refs/heads/powerflow/feat && pass "integ-leaselost-branch" || fail "integ-leaselost-branch" "task branch touched after lease loss"
+[ -d "$WT" ] && pass "integ-leaselost-wt" || fail "integ-leaselost-wt" "task worktree touched after lease loss"
+[ "$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null | grep '^HOLDER_TASK=' | cut -d= -f2)" = "thief" ] && pass "integ-leaselost-thief-holds" || fail "integ-leaselost-thief-holds" "thief lock disturbed by our exit"
+trap - EXIT; rm -rf "$TMP"
+
 # 2. Usage guards: no verify command, missing task dir, missing summary.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 (cd "$TMP" && bash "$INT" --task-dir .powerflow/nope --verify-command true --offline >/dev/null 2>&1); CODE=$?
@@ -184,6 +206,44 @@ assert_exit "integ-preflight-stale-sha" 4 "$CODE"
 (cd "$TMP" && bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command true --offline --skip-preflight >/dev/null 2>&1); CODE=$?
 assert_exit "integ-preflight-skipped" 0 "$CODE"
 [ -f "$TMP/work.txt" ] && pass "integ-preflight-skipped-merged" || fail "integ-preflight-skipped-merged" "skip-preflight merge missing"
+trap - EXIT; rm -rf "$TMP"
+
+# 9. Legacy branch mode (no worktree): preflight runs in the current checkout
+#    only when it holds the task branch; elsewhere it refuses without
+#    --skip-preflight (no silent bypass).
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+(cd "$TMP" && bash "$ISOLATE" --task-slug 2026-10-17-leg --porcelain >/dev/null 2>&1)
+printf 'leg\n' > "$TMP/leg.txt"; git -C "$TMP" add leg.txt; git -C "$TMP" commit -qm "TASK-LEG: work"
+LEG_HEAD=$(git -C "$TMP" rev-parse HEAD)
+BASE_SHA_LEG=$(git -C "$TMP" merge-base HEAD main)
+mkdir -p "$TMP/.powerflow/2026-10-17-leg"
+{
+  printf '# Powerflow Summary — 2026-10-17-leg\n\n## Phase: Finishing — 2026-10-17\nDone: ready\nNext: done\n\n## Git State\n'
+  printf -- '- Base branch: main\n- Base ref: main\n- Base SHA: %s\n- Task branch: powerflow/2026-10-17-leg\n- Isolation: reused — 2026-10-17\n' "$BASE_SHA_LEG"
+} > "$TMP/.powerflow/2026-10-17-leg/summary.md"
+write_preflight_log "$TMP" "2026-10-17-leg" "$LEG_HEAD"
+(cd "$TMP" && bash "$INT" --task-dir .powerflow/2026-10-17-leg --verify-command true --offline >/dev/null 2>&1); CODE=$?
+assert_exit "integ-branchmode-ok" 0 "$CODE"
+[ "$(git -C "$TMP" rev-parse --abbrev-ref HEAD)" = "main" ] && [ -f "$TMP/leg.txt" ] && pass "integ-branchmode-merged" || fail "integ-branchmode-merged" "branch-mode merge missing"
+trap - EXIT; rm -rf "$TMP"
+
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+(cd "$TMP" && bash "$ISOLATE" --task-slug 2026-10-17-leg --porcelain >/dev/null 2>&1)
+printf 'leg\n' > "$TMP/leg.txt"; git -C "$TMP" add leg.txt; git -C "$TMP" commit -qm "TASK-LEG: work"
+LEG_HEAD=$(git -C "$TMP" rev-parse HEAD)
+BASE_SHA_LEG=$(git -C "$TMP" merge-base HEAD main)
+mkdir -p "$TMP/.powerflow/2026-10-17-leg"
+{
+  printf '# Powerflow Summary — 2026-10-17-leg\n\n## Phase: Finishing — 2026-10-17\nDone: ready\nNext: done\n\n## Git State\n'
+  printf -- '- Base branch: main\n- Base ref: main\n- Base SHA: %s\n- Task branch: powerflow/2026-10-17-leg\n- Isolation: reused — 2026-10-17\n' "$BASE_SHA_LEG"
+} > "$TMP/.powerflow/2026-10-17-leg/summary.md"
+write_preflight_log "$TMP" "2026-10-17-leg" "$LEG_HEAD"
+git -C "$TMP" checkout -q main
+(cd "$TMP" && bash "$INT" --task-dir .powerflow/2026-10-17-leg --verify-command true --offline >/dev/null 2>&1); CODE=$?
+assert_exit "integ-branchmode-refused" 4 "$CODE"
+(cd "$TMP" && bash "$INT" --task-dir .powerflow/2026-10-17-leg --verify-command true --offline --skip-preflight >/dev/null 2>&1); CODE=$?
+assert_exit "integ-branchmode-skip" 0 "$CODE"
+[ -f "$TMP/leg.txt" ] && pass "integ-branchmode-skip-merged" || fail "integ-branchmode-skip-merged" "skip merge missing"
 trap - EXIT; rm -rf "$TMP"
 
 summary_of
