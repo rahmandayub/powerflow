@@ -355,6 +355,13 @@ Rules (enforced by the script, same spirit as Sections 2–7):
    of merging blind. Takeover itself is a single atomic rename — concurrent
    steal attempts elect exactly one winner — and a heartbeat that finds
    another owner's token never touches the lease.
+9. **Ownership is proven by token, never by slug.** Every acquire mints a
+   `TOKEN` that must accompany each heartbeat and each (non-force) release;
+   the trap release included. A stale run returning for the SAME slug with an
+   old token can neither refresh nor delete the new lease — slug match alone
+   proves nothing, since a re-queued task legitimately re-acquires under its
+   own slug. Only an explicit operator `--force` breaks a lease without its
+   token.
 8. **Stacked tasks** (started with `--base-sha` on an UNMERGED dependency's
    commit) integrate in dependency order: after the dependency merges, the
    stacked task's Base SHA is an ancestor of the integration branch, so it

@@ -23,18 +23,21 @@ assert_exit "lock-run-no-cmd" 2 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
 # 2. Acquire -> held for others (exit 3) -> release by other refused ->
-#    release by holder frees.
+#    release by holder (with its token) frees. Tokenless release is usage.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
-(cd "$TMP" && bash "$LOCK" acquire --task aaa >/dev/null 2>&1); CODE=$?
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --porcelain 2>/dev/null); CODE=$?
 assert_exit "lock-acquire-exit" 0 "$CODE"
+TOK_A=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
 (cd "$TMP" && bash "$LOCK" acquire --task bbb >/dev/null 2>&1); CODE=$?
 assert_exit "lock-held-refused" 3 "$CODE"
 OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
 assert_contains "lock-status-held" "$OUT" "^LOCK=held$"
 assert_contains "lock-status-holder" "$OUT" "^HOLDER_TASK=aaa$"
-(cd "$TMP" && bash "$LOCK" release --task bbb >/dev/null 2>&1); CODE=$?
+(cd "$TMP" && bash "$LOCK" release --task bbb --token bogus >/dev/null 2>&1); CODE=$?
 assert_exit "lock-release-wrong" 1 "$CODE"
 (cd "$TMP" && bash "$LOCK" release --task aaa >/dev/null 2>&1); CODE=$?
+assert_exit "lock-release-no-token" 2 "$CODE"
+(cd "$TMP" && bash "$LOCK" release --task aaa --token "$TOK_A" >/dev/null 2>&1); CODE=$?
 assert_exit "lock-release-exit" 0 "$CODE"
 OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
 assert_contains "lock-status-free-again" "$OUT" "^LOCK=free$"
@@ -59,20 +62,52 @@ TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 assert_exit "lock-fresh-kept" 3 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
-# 4b. Heartbeat: owner refresh resets staleness; others cannot refresh.
-#     Legacy info files without HEARTBEAT fall back to SINCE.
+# 4b. Heartbeat: owner refresh (task+token) resets staleness; anything else
+#     is refused without touching the lease. Legacy info files without
+#     HEARTBEAT/TOKEN fall back to SINCE.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
-(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 >/dev/null 2>&1)
-printf 'PID=1\nTASK=aaa\nSINCE=1\n' > "$TMP/.powerflow/.integration-lock/info"
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 --porcelain 2>/dev/null)
+TOK_A=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+printf 'PID=1\nTASK=aaa\nSINCE=1\nTOKEN=%s\n' "$TOK_A" > "$TMP/.powerflow/.integration-lock/info"
 OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
 assert_contains "lock-legacy-stale" "$OUT" "^LOCK=stale$"
-(cd "$TMP" && bash "$LOCK" heartbeat --task bbb >/dev/null 2>&1); CODE=$?
-assert_exit "lock-heartbeat-wrong" 1 "$CODE"
 (cd "$TMP" && bash "$LOCK" heartbeat --task aaa >/dev/null 2>&1); CODE=$?
+assert_exit "lock-heartbeat-no-token" 2 "$CODE"
+(cd "$TMP" && bash "$LOCK" heartbeat --task bbb --token "$TOK_A" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-heartbeat-wrong" 1 "$CODE"
+(cd "$TMP" && bash "$LOCK" heartbeat --task aaa --token bogus >/dev/null 2>&1); CODE=$?
+assert_exit "lock-heartbeat-bad-token" 1 "$CODE"
+(cd "$TMP" && bash "$LOCK" heartbeat --task aaa --token "$TOK_A" >/dev/null 2>&1); CODE=$?
 assert_exit "lock-heartbeat-exit" 0 "$CODE"
 (cd "$TMP" && bash "$LOCK" acquire --task ccc --stale-after 100 >/dev/null 2>&1); CODE=$?
 assert_exit "lock-heartbeat-protects" 3 "$CODE"
 grep -Eq '^HEARTBEAT=[0-9]+$' "$TMP/.powerflow/.integration-lock/info" && pass "lock-heartbeat-recorded" || fail "lock-heartbeat-recorded" "no HEARTBEAT line in lock info"
+[ "$(grep '^TOKEN=' "$TMP/.powerflow/.integration-lock/info" | cut -d= -f2)" = "$TOK_A" ] && pass "lock-heartbeat-token-stable" || fail "lock-heartbeat-token-stable" "heartbeat rotated the token"
+rm -rf "$TMP"; trap - EXIT
+
+# 4d. SAME-SLUG takeover: old owner (token A, task aaa) stalls, a re-queued
+#     run under the SAME slug steals with token B. The old owner's heartbeat
+#     and release must both fail; the new lease stays intact.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 --porcelain 2>/dev/null)
+TOK_A=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+printf 'PID=1\nTASK=aaa\nSINCE=1\nHEARTBEAT=1\nTOKEN=%s\n' "$TOK_A" > "$TMP/.powerflow/.integration-lock/info"
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 --porcelain 2>/dev/null); CODE=$?
+assert_exit "lock-sameslug-steal" 0 "$CODE"
+TOK_B=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+[ -n "$TOK_B" ] && [ "$TOK_B" != "$TOK_A" ] && pass "lock-sameslug-distinct" || fail "lock-sameslug-distinct" "re-acquire did not mint a new token"
+(cd "$TMP" && bash "$LOCK" heartbeat --task aaa --token "$TOK_A" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-sameslug-hb-refused" 1 "$CODE"
+(cd "$TMP" && bash "$LOCK" release --task aaa --token "$TOK_A" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-sameslug-rel-refused" 1 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-sameslug-intact" "$OUT" "^HOLDER_TOKEN=$TOK_B$"
+(cd "$TMP" && bash "$LOCK" heartbeat --task aaa --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-sameslug-hb-ok" 0 "$CODE"
+(cd "$TMP" && bash "$LOCK" release --task aaa --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-sameslug-rel-ok" 0 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-sameslug-free" "$OUT" "^LOCK=free$"
 rm -rf "$TMP"; trap - EXIT
 
 # 4c. Run mode outlives --stale-after: heartbeat keeps a slow child locked.
@@ -112,7 +147,7 @@ OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --porcelain 2>/dev/null); COD
 assert_exit "lock-token-acquire" 0 "$CODE"
 TOK1=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
 [ -n "$TOK1" ] && pass "lock-token-minted" || fail "lock-token-minted" "no TOKEN in acquire porcelain"
-(cd "$TMP" && bash "$LOCK" heartbeat --task aaa >/dev/null 2>&1); CODE=$?
+(cd "$TMP" && bash "$LOCK" heartbeat --task aaa --token "$TOK1" >/dev/null 2>&1); CODE=$?
 assert_exit "lock-token-hb" 0 "$CODE"
 TOK2=$(grep '^TOKEN=' "$TMP/.powerflow/.integration-lock/info" | cut -d= -f2)
 [ "$TOK2" = "$TOK1" ] && pass "lock-token-stable" || fail "lock-token-stable" "heartbeat changed token $TOK1 -> $TOK2"
@@ -121,7 +156,7 @@ assert_contains "lock-token-status" "$OUT" "^HOLDER_TOKEN=$TOK1$"
 # Simulate a steal without rename (direct rewrite, as a racing writer would):
 # the old owner's heartbeat must refuse, and the lease must stay intact.
 printf 'PID=9\nTASK=bbb\nSINCE=%s\nHEARTBEAT=%s\nTOKEN=tok-bbb\n' "$(date +%s)" "$(date +%s)" > "$TMP/.powerflow/.integration-lock/info"
-(cd "$TMP" && bash "$LOCK" heartbeat --task aaa >/dev/null 2>&1); CODE=$?
+(cd "$TMP" && bash "$LOCK" heartbeat --task aaa --token "$TOK1" >/dev/null 2>&1); CODE=$?
 assert_exit "lock-token-hb-refused" 1 "$CODE"
 [ "$(grep '^TASK=' "$TMP/.powerflow/.integration-lock/info" | cut -d= -f2)" = "bbb" ] && pass "lock-token-no-clobber" || fail "lock-token-no-clobber" "heartbeat overwrote another lease"
 rm -rf "$TMP"; trap - EXIT

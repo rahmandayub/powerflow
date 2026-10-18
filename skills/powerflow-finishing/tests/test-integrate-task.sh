@@ -107,6 +107,25 @@ git -C "$TMP" show-ref --verify --quiet refs/heads/powerflow/feat && pass "integ
 [ "$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null | grep '^HOLDER_TASK=' | cut -d= -f2)" = "thief" ] && pass "integ-leaselost-thief-holds" || fail "integ-leaselost-thief-holds" "thief lock disturbed by our exit"
 trap - EXIT; rm -rf "$TMP"
 
+# 1e. Same-slug steal mid-run: the old run finishes its own cleanup, but its
+#     trap release (old token) must NOT delete the new lease under the SAME
+#     slug — the re-queued run keeps the queue.
+read -r TMP SLUG WT < <(make_integ_task); trap 'rm -rf "$TMP"' EXIT
+(cd "$TMP" && bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command "sleep 4" --offline >/dev/null 2>&1) &
+INTPID=$!
+sleep 1
+INFO="$TMP/.powerflow/.integration-lock/info"
+TOK_OLD=$(grep '^TOKEN=' "$INFO" | cut -d= -f2)
+printf 'PID=%s\nTASK=%s\nSINCE=1\nHEARTBEAT=1\nTOKEN=%s\n' "$$" "$SLUG" "$TOK_OLD" > "$INFO"
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task "$SLUG" --porcelain 2>/dev/null); CODE=$?
+assert_exit "integ-sameslug-steal" 0 "$CODE"
+TOK_NEW=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+[ "$TOK_NEW" != "$TOK_OLD" ] && pass "integ-sameslug-distinct" || fail "integ-sameslug-distinct" "no new token minted"
+wait "$INTPID"; CODE=$?
+assert_exit "integ-sameslug-old-done" 0 "$CODE"
+[ "$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null | grep '^HOLDER_TOKEN=' | cut -d= -f2)" = "$TOK_NEW" ] && pass "integ-sameslug-lease-survives" || fail "integ-sameslug-lease-survives" "old trap release deleted the new lease"
+trap - EXIT; rm -rf "$TMP"
+
 # 2. Usage guards: no verify command, missing task dir, missing summary.
 TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
 (cd "$TMP" && bash "$INT" --task-dir .powerflow/nope --verify-command true --offline >/dev/null 2>&1); CODE=$?
@@ -159,14 +178,16 @@ git -C "$TMP" show-ref --verify --quiet refs/heads/powerflow/feat && pass "integ
 [ -z "$(git -C "$TMP" status --porcelain | grep -v '^??' | grep -v '^ *$' || true)" ] && pass "integ-conflict-clean" || fail "integ-conflict-clean" "aborted merge left tracked dirt"
 trap - EXIT; rm -rf "$TMP"
 
-# 6. Locked queue (exit 3): no merge attempted; works after release.
+# 6. Locked queue (exit 3): no merge attempted; works after token release.
 read -r TMP SLUG WT < <(make_integ_task); trap 'rm -rf "$TMP"' EXIT
 BEFORE=$(git -C "$TMP" rev-parse main)
-(cd "$TMP" && bash "$LOCK" acquire --task other >/dev/null 2>&1)
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task other --porcelain 2>/dev/null)
+TOK_OTHER=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
 (cd "$TMP" && bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command true --offline >/dev/null 2>&1); CODE=$?
 assert_exit "integ-locked-exit" 3 "$CODE"
 [ "$(git -C "$TMP" rev-parse main)" = "$BEFORE" ] && pass "integ-locked-untouched" || fail "integ-locked-untouched" "main moved while locked"
-(cd "$TMP" && bash "$LOCK" release --task other >/dev/null 2>&1)
+(cd "$TMP" && bash "$LOCK" release --task other --token "$TOK_OTHER" >/dev/null 2>&1); CODE=$?
+assert_exit "integ-release-token" 0 "$CODE"
 (cd "$TMP" && bash "$INT" --task-dir ".powerflow/$SLUG" --verify-command true --offline >/dev/null 2>&1); CODE=$?
 assert_exit "integ-after-release" 0 "$CODE"
 trap - EXIT; rm -rf "$TMP"

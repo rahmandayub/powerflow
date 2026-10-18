@@ -143,10 +143,16 @@ stop_integrate_heartbeat() {
   fi
 }
 LOCK_HELD=false
+LEASE_TOKEN=""
 release_lock() {
   stop_integrate_heartbeat
   if [ "$LOCK_HELD" = true ]; then
-    bash "$LOCK_SH" release --task "$TASK_SLUG" >/dev/null 2>&1 || true
+    # Token-scoped release: if our lease was stolen (even by a re-queued run
+    # under the SAME slug), the token mismatch refuses — the trap can never
+    # delete the new owner's lease.
+    if [ -n "$LEASE_TOKEN" ]; then
+      bash "$LOCK_SH" release --task "$TASK_SLUG" --token "$LEASE_TOKEN" >/dev/null 2>&1 || true
+    fi
     LOCK_HELD=false
   fi
 }
@@ -169,7 +175,7 @@ if [ "$CODE" -ne 0 ]; then
   exit "$CODE"  # 3 held, 1 race/error
 fi
 LEASE_TOKEN=$(printf '%s' "$ACQ_OUT" | grep '^TOKEN=' | cut -d= -f2 || true)
-[ -n "$LEASE_TOKEN" ] || fail "acquire succeeded but returned no lease token"
+[ -n "$LEASE_TOKEN" ] || fail "acquire succeeded but returned no lease token — refusing to proceed without ownership proof"
 LOCK_HELD=true
 # Lease-loss detection: the heartbeat NEVER swallows failures — any failed
 # refresh plants LEASE_LOST, and assert_lease re-verifies the live token
@@ -180,7 +186,7 @@ rm -f "$LEASE_LOST"
 EVERY=$(heartbeat_every)
 ( while true; do
     sleep "$EVERY"
-    bash "$LOCK_SH" heartbeat --task "$TASK_SLUG" >/dev/null 2>&1 || touch "$LEASE_LOST"
+    bash "$LOCK_SH" heartbeat --task "$TASK_SLUG" --token "$LEASE_TOKEN" >/dev/null 2>&1 || touch "$LEASE_LOST"
   done ) &
 HEART_PID_INT=$!
 

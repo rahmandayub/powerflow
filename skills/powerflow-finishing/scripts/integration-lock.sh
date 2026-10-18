@@ -24,25 +24,34 @@ set -euo pipefail
 #
 # Usage:
 #   integration-lock.sh acquire --task <slug> [--stale-after N] [--porcelain]
-#   integration-lock.sh release --task <slug> [--force] [--porcelain]
-#   integration-lock.sh heartbeat --task <slug> [--porcelain]
+#   integration-lock.sh release --task <slug> --token <tok> [--porcelain]
+#     (--force instead of --token: explicit operator break, skips the check)
+#   integration-lock.sh heartbeat --task <slug> --token <tok> [--porcelain]
 #   integration-lock.sh status [--porcelain]
 #   integration-lock.sh run --task <slug> [--stale-after N] -- <command...>
 #
-# Exit codes: 0 ok (acquired/released/refreshed/free/command ok) | 1 error |
-#   2 usage or not a git repo | 3 held by another task (acquire only) |
+# Ownership is proven by TOKEN, never by slug alone: the token minted at
+# acquire must accompany every heartbeat and (non-force) release. A stale
+# integrator returning for the SAME slug with an old token can neither
+# refresh nor delete the new lease — slug match alone proves nothing, since
+# a re-queued task legitimately re-acquires under its own slug.
+#
+# Exit codes: 0 ok (acquired/released/refreshed/free/command ok) | 1 error
+#   (incl. token mismatch) | 2 usage or not a git repo |
+#   3 held by another task (acquire only) |
 #   run exits with the child command's code (or 3 when locked).
 
 CMD="${1:-}"
 if [ -n "$CMD" ]; then shift; else CMD=""; fi
 TASK=""
+TOKEN_REQ=""
 FORCE=false
 PORCELAIN_OUT=false
 STALE_AFTER=1800
 RUN_ARGS=()
 
 usage() {
-  echo "Usage: integration-lock.sh (acquire --task <slug>|release --task <slug> [--force]|heartbeat --task <slug>|status|run --task <slug> -- <command...>) [--stale-after N] [--porcelain]" >&2
+  echo "Usage: integration-lock.sh (acquire --task <slug>|release --task <slug> (--token <tok>|--force)|heartbeat --task <slug> --token <tok>|status|run --task <slug> -- <command...>) [--stale-after N] [--porcelain]" >&2
   exit 2
 }
 
@@ -54,6 +63,7 @@ esac
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --task) TASK="${2:-}"; shift 2 ;;
+    --token) TOKEN_REQ="${2:-}"; shift 2 ;;
     --force) FORCE=true; shift ;;
     --porcelain) PORCELAIN_OUT=true; shift ;;
     --stale-after) STALE_AFTER="${2:-}"; shift 2 ;;
@@ -64,6 +74,14 @@ done
 
 if { [ "$CMD" = "acquire" ] || [ "$CMD" = "release" ] || [ "$CMD" = "heartbeat" ] || [ "$CMD" = "run" ]; } && [ -z "$TASK" ]; then
   echo "Error: --task <slug> is required for $CMD" >&2
+  exit 2
+fi
+if [ "$CMD" = "heartbeat" ] && [ -z "$TOKEN_REQ" ]; then
+  echo "Error: --token <tok> is required for heartbeat (ownership is proven by token, not slug)" >&2
+  exit 2
+fi
+if [ "$CMD" = "release" ] && [ "$FORCE" = false ] && [ -z "$TOKEN_REQ" ]; then
+  echo "Error: --token <tok> is required for release (or --force for an explicit operator break)" >&2
   exit 2
 fi
 if [ "$CMD" = "run" ] && [ "${#RUN_ARGS[@]}" -eq 0 ]; then
@@ -99,8 +117,12 @@ new_token() { # new_token -> unique owner identity for one acquire
 }
 
 lock_holder() { # lock_holder -> prints "PID TASK SINCE HEARTBEAT TOKEN" or fails
-  # HEARTBEAT/TOKEN are empty for leases written before they existed;
-  # callers must read them as ${4:-}/${5:-} and fall back to SINCE.
+  # Fields are space-joined and positionally parsed, so absent trailing
+  # fields MUST NOT shift positions: missing HEARTBEAT/TOKEN (leases written
+  # before they existed) print as `-`. Consumers treat `-` as unknown:
+  # freshest_ts falls back to SINCE, and a `-` token never equals a real
+  # ownership token (a tokenless legacy lease can only be taken by steal or
+  # operator --force, never refreshed/released by token).
   local pid="" task="" since="" hb="" tok=""
   [ -f "$INFO" ] || return 1
   pid=$(grep -E '^PID=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
@@ -109,7 +131,7 @@ lock_holder() { # lock_holder -> prints "PID TASK SINCE HEARTBEAT TOKEN" or fail
   hb=$(grep -E '^HEARTBEAT=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
   tok=$(grep -E '^TOKEN=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
   [ -n "$pid" ] && [ -n "$task" ] && [ -n "$since" ] || return 1
-  printf '%s %s %s %s %s' "$pid" "$task" "$since" "$hb" "$tok"
+  printf '%s %s %s %s %s' "$pid" "$task" "$since" "${hb:--}" "${tok:--}"
 }
 
 freshest_ts() { # freshest_ts <since> [heartbeat] -> newest numeric ts or "unknown"
@@ -146,6 +168,8 @@ write_info() { # write_info <pid> <task> <since> <token> — atomic via tmp+mv
 }
 
 read_info_at() { # read_info_at <infofile> -> "PID TASK SINCE HEARTBEAT TOKEN" or fails
+  # Same `-` anchoring as lock_holder: absent trailing fields must not
+  # shift positions (see above).
   local f="$1" pid="" task="" since="" hb="" tok=""
   [ -f "$f" ] || return 1
   pid=$(grep -E '^PID=' "$f" 2>/dev/null | cut -d= -f2 || true)
@@ -154,7 +178,7 @@ read_info_at() { # read_info_at <infofile> -> "PID TASK SINCE HEARTBEAT TOKEN" o
   hb=$(grep -E '^HEARTBEAT=' "$f" 2>/dev/null | cut -d= -f2 || true)
   tok=$(grep -E '^TOKEN=' "$f" 2>/dev/null | cut -d= -f2 || true)
   [ -n "$pid" ] && [ -n "$task" ] && [ -n "$since" ] || return 1
-  printf '%s %s %s %s %s' "$pid" "$task" "$since" "$hb" "$tok"
+  printf '%s %s %s %s %s' "$pid" "$task" "$since" "${hb:--}" "${tok:--}"
 }
 
 do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_TOKEN
@@ -312,33 +336,39 @@ adopt_stale_aside() { # adopt_stale_aside -> prints adopted dir, or fails
   printf '%s' "$LOCK_DIR"
 }
 
-do_heartbeat() { # do_heartbeat -> 0 refreshed, 1 held-by-other/gone
-  # Refreshes the lease ONLY when this task still owns it — the token is
-  # preserved, and another task's lease is never clobbered (e.g. after a
-  # legitimate steal). A heartbeat racing a takeover either lands in the
-  # detached aside dir (harmless) or fails — both surface as non-zero, which
-  # the owner must treat as lease loss, never ignore.
+do_heartbeat() { # do_heartbeat -> 0 refreshed, 1 mismatch/gone
+  # Refreshes the lease ONLY when task AND token both match the live lease —
+  # a returning stale owner with the same slug but an old token is refused,
+  # and another owner's lease is never clobbered (e.g. after a legitimate
+  # steal). The token is preserved across refreshes. A heartbeat racing a
+  # takeover either lands in the detached aside dir (harmless) or fails —
+  # both surface as non-zero, which the owner must treat as lease loss,
+  # never ignore.
   local holder task since hb pid tok
   holder=$(lock_holder) || { echo "Error: no integration lock to refresh." >&2; return 1; }
   # shellcheck disable=SC2086
   set -- $holder
   pid="$1"; task="$2"; since="$3"; hb="${4:-}"; tok="${5:-}"
-  if [ "$task" != "$TASK" ]; then
-    echo "Error: lock held by task '$task', not '$TASK' — not refreshing." >&2
+  if [ "$task" != "$TASK" ] || [ "$tok" != "$TOKEN_REQ" ]; then
+    echo "Error: lease owned by task '$task' (token ${tok:-none}) — heartbeat token does not match; not refreshing." >&2
     return 1
   fi
   write_info "$pid" "$task" "$since" "$tok" || { echo "Error: cannot refresh lock." >&2; return 1; }
   return 0
 }
 
-do_release() { # do_release -> 0 released/already-free, 1 held-by-other
-  local holder task
+do_release() { # do_release -> 0 released/already-free, 1 mismatch
+  # Deletes the lease ONLY when task AND token both match — unless --force
+  # (explicit operator break, which skips the token check). A stale owner
+  # returning for the same slug with an old token can never delete the new
+  # lease via a trap release.
+  local holder task tok
   if holder=$(lock_holder); then
     # shellcheck disable=SC2086
     set -- $holder
-    task="$2"
-    if [ "$task" != "$TASK" ] && [ "$FORCE" = false ]; then
-      echo "Error: lock held by task '$task', not '$TASK'. Use --force to break it." >&2
+    task="$2"; tok="${5:-}"
+    if [ "$FORCE" = false ] && { [ "$task" != "$TASK" ] || [ "$tok" != "$TOKEN_REQ" ]; }; then
+      echo "Error: lease owned by task '$task' (token ${tok:-none}) — release token does not match. Use --force to break it." >&2
       return 1
     fi
     rm -rf "$LOCK_DIR"
@@ -360,12 +390,12 @@ heartbeat_every() { # heartbeat_every -> seconds between refreshes
 }
 
 HEART_PID=""
-start_heartbeat_loop() { # start_heartbeat_loop <task> — refreshes until stopped
-  local hb_task="$1" every
+start_heartbeat_loop() { # start_heartbeat_loop <task> <token> — refreshes until stopped
+  local hb_task="$1" hb_token="$2" every
   every=$(heartbeat_every)
   ( while true; do
       sleep "$every"
-      bash "$0" heartbeat --task "$hb_task" >/dev/null 2>&1 || true
+      bash "$0" heartbeat --task "$hb_task" --token "$hb_token" >/dev/null 2>&1 || true
     done ) &
   HEART_PID=$!
 }
@@ -434,22 +464,23 @@ case "$CMD" in
       exit "$CODE"
     fi
     echo "Integration lock acquired for task '$TASK' (run mode)." >&2
-    start_heartbeat_loop "$TASK"
+    start_heartbeat_loop "$TASK" "$ACQUIRED_TOKEN"
     set +e
     "${RUN_ARGS[@]}"
     CODE=$?
     set -e
     stop_heartbeat_loop
-    # Release only if we still hold it (a nested --force release or an
-    # operator break may have removed it; never delete another task's lock).
+    # Release only if OUR token still holds it (a nested --force release, a
+    # steal, or an operator break may have replaced it; never delete another
+    # lease — not even one under the same task slug).
     if HOLDER=$(lock_holder); then
       # shellcheck disable=SC2086
       set -- $HOLDER
-      if [ "$2" = "$TASK" ]; then
+      if [ "$2" = "$TASK" ] && [ "${5:-}" = "$ACQUIRED_TOKEN" ]; then
         rm -rf "$LOCK_DIR"
         echo "Integration lock released (run mode, child exit $CODE)." >&2
       else
-        echo "WARNING: lock now held by task '$2'; leaving it (run mode)." >&2
+        echo "WARNING: lease now owned by task '$2' (token ${5:-none}); leaving it (run mode)." >&2
       fi
     else
       echo "WARNING: lock already gone on child exit $CODE (run mode)." >&2
