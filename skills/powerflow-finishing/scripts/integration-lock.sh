@@ -22,6 +22,27 @@ set -euo pipefail
 # `run` subcommand: it holds the lock for exactly the lifetime of the child
 # command (with heartbeat) and always releases it.
 #
+# Check-then-act safety:
+# 1. Heartbeat updates a token-scoped file (heartbeat.<token>), NEVER
+#    rewriting ownership metadata (info) through the shared path. Even if a
+#    heartbeat pauses after reading the lease, it cannot overwrite a replacement
+#    lease's metadata, nor refresh another lease's staleness.
+# 2. Release uses verify-after-move: the lock dir is atomically renamed
+#    aside first, and its token is verified before deletion. If takeover slipped
+#    in during a pause, the replacement lease is restored unharmed and release
+#    is refused with exit 1.
+#
+# Architectural boundary:
+# A time-bounded lease with expiration (--stale-after) cannot provide
+# absolute mutual exclusion against arbitrary process pauses (e.g. SIGSTOP,
+# VM freeze, or multi-minute GC pauses) that resume execution immediately
+# after the final pre-mutation lease verification. Absolute exclusion
+# against arbitrary pauses requires fencing tokens enforced by the target
+# resource (e.g. storage/git server rejecting writes with older epochs) or
+# a non-expiring lock (which sacrifices automatic crash recovery).
+# Stale lease stealing is a conscious design trade-off for unattended crash
+# recovery in a portable, serverless filesystem environment.
+#
 # Usage:
 #   integration-lock.sh acquire --task <slug> [--stale-after N] [--porcelain]
 #   integration-lock.sh release --task <slug> --token <tok> [--porcelain]
@@ -116,6 +137,28 @@ new_token() { # new_token -> unique owner identity for one acquire
   printf '%s-%s-%s' "$$" "$(date +%s)" "$RANDOM"
 }
 
+read_info_at() { # read_info_at <infofile> -> "PID TASK SINCE HEARTBEAT TOKEN" or fails
+  # Same `-` anchoring as lock_holder: absent trailing fields must not
+  # shift positions (see above).
+  # Heartbeat is read first from the token-scoped file (heartbeat.<token>)
+  # in the lock dir, falling back to HEARTBEAT in info for legacy leases/tests.
+  local f="$1" pid="" task="" since="" hb="" tok="" dir=""
+  [ -f "$f" ] || return 1
+  pid=$(grep -E '^PID=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  task=$(grep -E '^TASK=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  since=$(grep -E '^SINCE=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  tok=$(grep -E '^TOKEN=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  [ -n "$pid" ] && [ -n "$task" ] && [ -n "$since" ] || return 1
+  dir=$(dirname "$f")
+  if [ -n "$tok" ] && [ "$tok" != "-" ] && [ -f "$dir/heartbeat.$tok" ]; then
+    hb=$(cat "$dir/heartbeat.$tok" 2>/dev/null || true)
+  fi
+  if [ -z "$hb" ]; then
+    hb=$(grep -E '^HEARTBEAT=' "$f" 2>/dev/null | cut -d= -f2 || true)
+  fi
+  printf '%s %s %s %s %s' "$pid" "$task" "$since" "${hb:--}" "${tok:--}"
+}
+
 lock_holder() { # lock_holder -> prints "PID TASK SINCE HEARTBEAT TOKEN" or fails
   # Fields are space-joined and positionally parsed, so absent trailing
   # fields MUST NOT shift positions: missing HEARTBEAT/TOKEN (leases written
@@ -123,15 +166,7 @@ lock_holder() { # lock_holder -> prints "PID TASK SINCE HEARTBEAT TOKEN" or fail
   # freshest_ts falls back to SINCE, and a `-` token never equals a real
   # ownership token (a tokenless legacy lease can only be taken by steal or
   # operator --force, never refreshed/released by token).
-  local pid="" task="" since="" hb="" tok=""
-  [ -f "$INFO" ] || return 1
-  pid=$(grep -E '^PID=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
-  task=$(grep -E '^TASK=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
-  since=$(grep -E '^SINCE=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
-  hb=$(grep -E '^HEARTBEAT=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
-  tok=$(grep -E '^TOKEN=' "$INFO" 2>/dev/null | cut -d= -f2 || true)
-  [ -n "$pid" ] && [ -n "$task" ] && [ -n "$since" ] || return 1
-  printf '%s %s %s %s %s' "$pid" "$task" "$since" "${hb:--}" "${tok:--}"
+  read_info_at "$INFO"
 }
 
 freshest_ts() { # freshest_ts <since> [heartbeat] -> newest numeric ts or "unknown"
@@ -161,24 +196,12 @@ lock_is_stale() { # lock_is_stale <since> [heartbeat] -> 0 when lease expired
 }
 
 write_info() { # write_info <pid> <task> <since> <token> — atomic via tmp+mv
+  # Info holds immutable ownership metadata for the lease directory.
+  # Heartbeat timestamps are written to heartbeat.<token>, never rewriting info.
   local tmp
   tmp=$(mktemp "$LOCK_DIR/.tmp.XXXXXX" 2>/dev/null) || return 1
-  printf 'PID=%s\nTASK=%s\nSINCE=%s\nHEARTBEAT=%s\nTOKEN=%s\n' "$1" "$2" "$3" "$(now_s)" "$4" > "$tmp"
+  printf 'PID=%s\nTASK=%s\nSINCE=%s\nHEARTBEAT=%s\nTOKEN=%s\n' "$1" "$2" "$3" "$3" "$4" > "$tmp"
   mv -f "$tmp" "$INFO"
-}
-
-read_info_at() { # read_info_at <infofile> -> "PID TASK SINCE HEARTBEAT TOKEN" or fails
-  # Same `-` anchoring as lock_holder: absent trailing fields must not
-  # shift positions (see above).
-  local f="$1" pid="" task="" since="" hb="" tok=""
-  [ -f "$f" ] || return 1
-  pid=$(grep -E '^PID=' "$f" 2>/dev/null | cut -d= -f2 || true)
-  task=$(grep -E '^TASK=' "$f" 2>/dev/null | cut -d= -f2 || true)
-  since=$(grep -E '^SINCE=' "$f" 2>/dev/null | cut -d= -f2 || true)
-  hb=$(grep -E '^HEARTBEAT=' "$f" 2>/dev/null | cut -d= -f2 || true)
-  tok=$(grep -E '^TOKEN=' "$f" 2>/dev/null | cut -d= -f2 || true)
-  [ -n "$pid" ] && [ -n "$task" ] && [ -n "$since" ] || return 1
-  printf '%s %s %s %s %s' "$pid" "$task" "$since" "${hb:--}" "${tok:--}"
 }
 
 do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_TOKEN
@@ -202,9 +225,9 @@ do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_T
   ACQUIRED_MODE=""
   ACQUIRED_TOKEN=""
   mkdir -p "$MAIN_ROOT/.powerflow"
-  # Discard takeovers orphaned by a crash between rename and cleanup. Asides
-  # are never read back, so deleting them cannot affect a live lease.
-  rm -rf "$MAIN_ROOT"/.powerflow/.integration-lock.stale.* 2>/dev/null || true
+  # Discard takeovers and releases orphaned by a crash between rename and cleanup.
+  # Asides are never read back, so deleting them cannot affect a live lease.
+  rm -rf "$MAIN_ROOT"/.powerflow/.integration-lock.stale.* "$MAIN_ROOT"/.powerflow/.integration-lock.rel.* 2>/dev/null || true
   local attempt holder pid task since hb tok eff aside moved_tokens
   local absent_seen=0
   for attempt in 1 2 3 4 5 6 7 8; do
@@ -340,10 +363,16 @@ do_heartbeat() { # do_heartbeat -> 0 refreshed, 1 mismatch/gone
   # Refreshes the lease ONLY when task AND token both match the live lease —
   # a returning stale owner with the same slug but an old token is refused,
   # and another owner's lease is never clobbered (e.g. after a legitimate
-  # steal). The token is preserved across refreshes. A heartbeat racing a
-  # takeover either lands in the detached aside dir (harmless) or fails —
-  # both surface as non-zero, which the owner must treat as lease loss,
-  # never ignore.
+  # steal). The token is preserved across refreshes.
+  #
+  # Check-then-act safety:
+  # The heartbeat timestamp is written ONLY to a token-scoped file
+  # (heartbeat.$TOKEN), NEVER rewriting info (the lease ownership metadata).
+  # Even if delayed or paused, it cannot overwrite a replacement lease's
+  # PID/TASK/TOKEN metadata. After writing, verify-after-write confirms our
+  # lease is still active in $LOCK_DIR; if replaced during the write, the
+  # stray file is cleaned up and exit 1 is returned so the caller detects
+  # lease loss.
   local holder task since hb pid tok
   holder=$(lock_holder) || { echo "Error: no integration lock to refresh." >&2; return 1; }
   # shellcheck disable=SC2086
@@ -353,8 +382,37 @@ do_heartbeat() { # do_heartbeat -> 0 refreshed, 1 mismatch/gone
     echo "Error: lease owned by task '$task' (token ${tok:-none}) — heartbeat token does not match; not refreshing." >&2
     return 1
   fi
-  write_info "$pid" "$task" "$since" "$tok" || { echo "Error: cannot refresh lock." >&2; return 1; }
-  return 0
+
+  # Test seam: inject pause right after token check to verify takeover race protection
+  if [[ "${POWERFLOW_TEST_PAUSE_HEARTBEAT:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_TEST_PAUSE_HEARTBEAT:-0}" -gt 0 ]; then
+    sleep "$POWERFLOW_TEST_PAUSE_HEARTBEAT"
+  fi
+
+  local tmp now
+  now=$(now_s)
+  tmp=$(mktemp "$LOCK_DIR/.hb.XXXXXX" 2>/dev/null) || { echo "Error: cannot refresh lock." >&2; return 1; }
+  printf '%s\n' "$now" > "$tmp"
+  if ! mv -f "$tmp" "$LOCK_DIR/heartbeat.$TOKEN_REQ" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    echo "Error: cannot refresh lock (lease moved or unavailable)." >&2
+    return 1
+  fi
+
+  # Verify-after-write: confirm our lease is still the active one in $LOCK_DIR.
+  local verify_holder verify_task verify_tok
+  if verify_holder=$(lock_holder); then
+    # shellcheck disable=SC2086
+    set -- $verify_holder
+    verify_task="$2"; verify_tok="${5:-}"
+    if [ "$verify_task" = "$TASK" ] && [ "$verify_tok" = "$TOKEN_REQ" ]; then
+      return 0
+    fi
+  fi
+
+  # Lease was replaced or removed while writing!
+  rm -f "$LOCK_DIR/heartbeat.$TOKEN_REQ" 2>/dev/null || true
+  echo "Error: integration lock changed hands during heartbeat; lease lost." >&2
+  return 1
 }
 
 do_release() { # do_release -> 0 released/already-free, 1 mismatch
@@ -362,20 +420,74 @@ do_release() { # do_release -> 0 released/already-free, 1 mismatch
   # (explicit operator break, which skips the token check). A stale owner
   # returning for the same slug with an old token can never delete the new
   # lease via a trap release.
+  #
+  # Check-then-act safety:
+  # Uses verify-after-move: instead of check-then-delete on the shared path
+  # (which races against a concurrent takeover replacing the lease between
+  # check and deletion), the lock dir is atomically renamed aside first.
+  # If the moved lease's token does not match, it is restored and release
+  # is refused with exit 1 without harming the replacement lease.
   local holder task tok
-  if holder=$(lock_holder); then
+  if [ "$FORCE" = false ]; then
+    if ! holder=$(lock_holder); then
+      echo "Integration lock already free." >&2
+      return 0
+    fi
     # shellcheck disable=SC2086
     set -- $holder
     task="$2"; tok="${5:-}"
-    if [ "$FORCE" = false ] && { [ "$task" != "$TASK" ] || [ "$tok" != "$TOKEN_REQ" ]; }; then
+    if [ "$task" != "$TASK" ] || [ "$tok" != "$TOKEN_REQ" ]; then
       echo "Error: lease owned by task '$task' (token ${tok:-none}) — release token does not match. Use --force to break it." >&2
       return 1
     fi
-    rm -rf "$LOCK_DIR"
-    echo "Integration lock released (was task '$task')." >&2
-    return 0
   fi
-  echo "Integration lock already free." >&2
+
+  # Test seam: inject pause right after token check to verify takeover race protection
+  if [[ "${POWERFLOW_TEST_PAUSE_RELEASE:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_TEST_PAUSE_RELEASE:-0}" -gt 0 ]; then
+    sleep "$POWERFLOW_TEST_PAUSE_RELEASE"
+  fi
+
+  local rel_aside
+  rel_aside="$MAIN_ROOT/.powerflow/.integration-lock.rel.$$"
+  rm -rf "$rel_aside" 2>/dev/null || true
+
+  if ! mv "$LOCK_DIR" "$rel_aside" 2>/dev/null; then
+    # Could not move: either already freed, or another process moved it.
+    if [ ! -e "$LOCK_DIR" ]; then
+      echo "Integration lock already free." >&2
+      return 0
+    fi
+    echo "Error: integration lock unsettled during release." >&2
+    return 1
+  fi
+
+  # Verify-after-move: check what was actually moved aside
+  if [ "$FORCE" = false ]; then
+    local moved_holder moved_task moved_tok
+    if moved_holder=$(read_info_at "$rel_aside/info"); then
+      # shellcheck disable=SC2086
+      set -- $moved_holder
+      moved_task="$2"; moved_tok="${5:-}"
+      if [ "$moved_task" != "$TASK" ] || [ "$moved_tok" != "$TOKEN_REQ" ]; then
+        echo "WARNING: release raced a replacement lease — restoring and refusing release." >&2
+        if [ ! -e "$LOCK_DIR" ]; then
+          mv "$rel_aside" "$LOCK_DIR" 2>/dev/null || true
+        fi
+        echo "Error: lease owned by task '$moved_task' (token ${moved_tok:-none}) — release token does not match. Use --force to break it." >&2
+        return 1
+      fi
+    else
+      # Info unreadable in moved dir and not force: restore and refuse
+      if [ ! -e "$LOCK_DIR" ]; then
+        mv "$rel_aside" "$LOCK_DIR" 2>/dev/null || true
+      fi
+      echo "Error: cannot verify lease in releasing dir; restored." >&2
+      return 1
+    fi
+  fi
+
+  rm -rf "$rel_aside"
+  echo "Integration lock released (was task '$TASK')." >&2
   return 0
 }
 
@@ -473,17 +585,12 @@ case "$CMD" in
     # Release only if OUR token still holds it (a nested --force release, a
     # steal, or an operator break may have replaced it; never delete another
     # lease — not even one under the same task slug).
-    if HOLDER=$(lock_holder); then
-      # shellcheck disable=SC2086
-      set -- $HOLDER
-      if [ "$2" = "$TASK" ] && [ "${5:-}" = "$ACQUIRED_TOKEN" ]; then
-        rm -rf "$LOCK_DIR"
-        echo "Integration lock released (run mode, child exit $CODE)." >&2
-      else
-        echo "WARNING: lease now owned by task '$2' (token ${5:-none}); leaving it (run mode)." >&2
-      fi
+    # Uses verify-after-move via do_release:
+    TOKEN_REQ="$ACQUIRED_TOKEN"
+    if do_release >/dev/null 2>&1; then
+      echo "Integration lock released (run mode, child exit $CODE)." >&2
     else
-      echo "WARNING: lock already gone on child exit $CODE (run mode)." >&2
+      echo "WARNING: lease now owned by another task or changed hands; leaving it (run mode)." >&2
     fi
     exit "$CODE"
     ;;

@@ -81,7 +81,7 @@ assert_exit "lock-heartbeat-bad-token" 1 "$CODE"
 assert_exit "lock-heartbeat-exit" 0 "$CODE"
 (cd "$TMP" && bash "$LOCK" acquire --task ccc --stale-after 100 >/dev/null 2>&1); CODE=$?
 assert_exit "lock-heartbeat-protects" 3 "$CODE"
-grep -Eq '^HEARTBEAT=[0-9]+$' "$TMP/.powerflow/.integration-lock/info" && pass "lock-heartbeat-recorded" || fail "lock-heartbeat-recorded" "no HEARTBEAT line in lock info"
+[ -f "$TMP/.powerflow/.integration-lock/heartbeat.$TOK_A" ] && grep -Eq '^[0-9]+$' "$TMP/.powerflow/.integration-lock/heartbeat.$TOK_A" && pass "lock-heartbeat-recorded" || fail "lock-heartbeat-recorded" "no heartbeat file recorded for token"
 [ "$(grep '^TOKEN=' "$TMP/.powerflow/.integration-lock/info" | cut -d= -f2)" = "$TOK_A" ] && pass "lock-heartbeat-token-stable" || fail "lock-heartbeat-token-stable" "heartbeat rotated the token"
 rm -rf "$TMP"; trap - EXIT
 
@@ -173,6 +173,79 @@ wait
 [ "$(grep -c '^0 ' "$TMP/race.out")" -eq 1 ] && pass "lock-storm-single-winner" || fail "lock-storm-single-winner" "$(cat "$TMP/race.out" | tr '\n' ' ')"
 [ "$(grep -c '^3 ' "$TMP/race.out")" -eq 5 ] && pass "lock-storm-losers-backoff" || fail "lock-storm-losers-backoff" "losers did not all get exit 3"
 ls "$TMP/.powerflow/" | grep -q stale && fail "lock-storm-leftovers" "stale aside dirs remain" || pass "lock-storm-leftovers"
+rm -rf "$TMP"; trap - EXIT
+
+# 8. Controlled Heartbeat Race: takeover during heartbeat pause.
+#    Old owner aaa (TOK_A) pauses right after token verification.
+#    Meanwhile, the lease is stolen by bbb (TOK_B).
+#    When the old heartbeat resumes, it MUST detect lease loss (exit 1),
+#    and MUST NOT overwrite bbb's info or heartbeat.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 --porcelain 2>/dev/null)
+TOK_A=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+# Backdate to make it stealable once takeover arrives
+printf 'PID=1\nTASK=aaa\nSINCE=1\nHEARTBEAT=1\nTOKEN=%s\n' "$TOK_A" > "$TMP/.powerflow/.integration-lock/info"
+# Start heartbeat with 2s pause after token verification
+(cd "$TMP" && POWERFLOW_TEST_PAUSE_HEARTBEAT=2 bash "$LOCK" heartbeat --task aaa --token "$TOK_A" >/dev/null 2>&1; echo "$?" > "$TMP/hb.code") &
+HBPID=$!
+# Wait briefly for heartbeat to enter its pause (after token verification)
+sleep 0.4
+# Takeover by bbb
+OUT_B=$(cd "$TMP" && bash "$LOCK" acquire --task bbb --stale-after 1 --porcelain 2>/dev/null); CODE=$?
+assert_exit "lock-hb-race-steal" 0 "$CODE"
+TOK_B=$(printf '%s' "$OUT_B" | grep '^TOKEN=' | cut -d= -f2)
+[ -n "$TOK_B" ] && [ "$TOK_B" != "$TOK_A" ] && pass "lock-hb-race-tok-diff" || fail "lock-hb-race-tok-diff" "no new token for bbb"
+wait "$HBPID"
+HB_CODE=$(cat "$TMP/hb.code")
+assert_exit "lock-hb-race-fail" 1 "$HB_CODE"
+# Verify bbb's lease was NOT corrupted by aaa's heartbeat
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-hb-race-b-task" "$OUT" "^HOLDER_TASK=bbb$"
+assert_contains "lock-hb-race-b-token" "$OUT" "^HOLDER_TOKEN=$TOK_B$"
+[ "$(grep '^TASK=' "$TMP/.powerflow/.integration-lock/info" | cut -d= -f2)" = "bbb" ] && pass "lock-hb-race-info-intact" || fail "lock-hb-race-info-intact" "aaa heartbeat overwrote bbb info"
+[ ! -f "$TMP/.powerflow/.integration-lock/heartbeat.$TOK_A" ] && pass "lock-hb-race-no-stray-hb" || fail "lock-hb-race-no-stray-hb" "stray heartbeat file left behind"
+# bbb can still heartbeat and release cleanly
+(cd "$TMP" && bash "$LOCK" heartbeat --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-hb-race-b-hb" 0 "$CODE"
+(cd "$TMP" && bash "$LOCK" release --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-hb-race-b-rel" 0 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-hb-race-free" "$OUT" "^LOCK=free$"
+rm -rf "$TMP"; trap - EXIT
+
+# 9. Controlled Release Race: takeover during release pause.
+#    Old owner aaa (TOK_A) pauses right after token verification.
+#    Meanwhile, the lease is stolen by bbb (TOK_B).
+#    When the old release resumes, verify-after-move MUST detect the mismatch,
+#    restore bbb's lease untouched, and exit with code 1.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 --porcelain 2>/dev/null)
+TOK_A=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+# Backdate to make it stealable
+printf 'PID=1\nTASK=aaa\nSINCE=1\nHEARTBEAT=1\nTOKEN=%s\n' "$TOK_A" > "$TMP/.powerflow/.integration-lock/info"
+# Start release with 2s pause after token verification
+(cd "$TMP" && POWERFLOW_TEST_PAUSE_RELEASE=2 bash "$LOCK" release --task aaa --token "$TOK_A" >/dev/null 2>&1; echo "$?" > "$TMP/rel.code") &
+RELPID=$!
+# Wait briefly for release to enter its pause (after token verification)
+sleep 0.4
+# Takeover by bbb
+OUT_B=$(cd "$TMP" && bash "$LOCK" acquire --task bbb --stale-after 1 --porcelain 2>/dev/null); CODE=$?
+assert_exit "lock-rel-race-steal" 0 "$CODE"
+TOK_B=$(printf '%s' "$OUT_B" | grep '^TOKEN=' | cut -d= -f2)
+[ -n "$TOK_B" ] && [ "$TOK_B" != "$TOK_A" ] && pass "lock-rel-race-tok-diff" || fail "lock-rel-race-tok-diff" "no new token for bbb"
+wait "$RELPID"
+REL_CODE=$(cat "$TMP/rel.code")
+assert_exit "lock-rel-race-fail" 1 "$REL_CODE"
+# Verify bbb's lease was restored and NOT deleted
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-rel-race-b-task" "$OUT" "^HOLDER_TASK=bbb$"
+assert_contains "lock-rel-race-b-token" "$OUT" "^HOLDER_TOKEN=$TOK_B$"
+[ "$(grep '^TASK=' "$TMP/.powerflow/.integration-lock/info" | cut -d= -f2)" = "bbb" ] && pass "lock-rel-race-info-intact" || fail "lock-rel-race-info-intact" "bbb info missing or corrupted"
+# bbb can still release its own lease
+(cd "$TMP" && bash "$LOCK" release --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-rel-race-b-rel" 0 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-rel-race-free" "$OUT" "^LOCK=free$"
 rm -rf "$TMP"; trap - EXIT
 
 summary_of

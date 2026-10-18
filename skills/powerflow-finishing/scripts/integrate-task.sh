@@ -332,6 +332,15 @@ if [[ "${POWERFLOW_PRE_MERGE_PAUSE:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_PRE_MER
 fi
 # Final ownership check immediately before the shared mutation: even with
 # heartbeats, a steal in the preceding gap must stop us HERE, not during.
+#
+# Architectural boundary:
+# assert_lease verifies lease ownership immediately before the git merge.
+# A time-bounded lease with expiration cannot prevent an arbitrary process
+# pause (e.g. SIGSTOP, VM freeze) that wakes up right after this check if the
+# lease expired and was stolen during the pause. Absolute exclusion against
+# arbitrary process pauses requires fencing tokens enforced by the target
+# resource (e.g. server-side push validation rejecting older epochs) or
+# non-expiring locks (which sacrifice unattended crash recovery).
 assert_lease "merging into the integration branch"
 MERGED_VIA=""
 if git -C "$LOC" merge --ff-only "$TASK_BRANCH" >/dev/null 2>&1; then

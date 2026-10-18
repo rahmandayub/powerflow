@@ -362,10 +362,32 @@ Rules (enforced by the script, same spirit as Sections 2–7):
    proves nothing, since a re-queued task legitimately re-acquires under its
    own slug. Only an explicit operator `--force` breaks a lease without its
    token.
-8. **Stacked tasks** (started with `--base-sha` on an UNMERGED dependency's
+   - **Heartbeat check-then-act safety**: Heartbeats write only to a
+     token-scoped file (`heartbeat.<token>`), never rewriting ownership
+     metadata (`info`). Even if delayed across a takeover, an old heartbeat
+     cannot overwrite a replacement lease's metadata, nor refresh its
+     staleness. Verify-after-write ensures that if replaced during write, exit
+     1 is returned and stray files are cleaned up.
+   - **Release check-then-act safety**: Release uses verify-after-move. The
+     lock directory is atomically renamed aside first, then its token is
+     verified before deletion. If takeover occurred during a pause, the
+     replacement lease is restored unharmed and release is refused with exit 1.
+10. **Stacked tasks** (started with `--base-sha` on an UNMERGED dependency's
    commit) integrate in dependency order: after the dependency merges, the
    stacked task's Base SHA is an ancestor of the integration branch, so it
    passes the diverged check as *stale* and merges with `--allow-stale-base`
    (verification still gates). A Base SHA that never enters the integration
    branch stays *diverged* and is refused — rebase onto the merged result
    instead. Stacking is supported only through this ordered pattern.
+11. **Architectural boundary: lease expiration vs. arbitrary process pauses.**
+   A time-bounded lease with expiration (`--stale-after`) cannot guarantee
+   absolute mutual exclusion against arbitrary process pauses (e.g. `SIGSTOP`,
+   hypervisor freeze, or multi-minute GC pauses) that resume execution
+   immediately after the final `assert_lease` check before `git merge`. For
+   absolute exclusion against arbitrary pauses, the underlying resource must
+   enforce fencing tokens (e.g. server-side push validation rejecting older
+   lease epochs) or use non-stealable critical locks (which sacrifice
+   unattended crash recovery). Stale lease stealing with heartbeat and
+   verify-after-move is an explicit design trade-off to provide automated
+   crash recovery without manual operator intervention in a portable
+   filesystem environment.
