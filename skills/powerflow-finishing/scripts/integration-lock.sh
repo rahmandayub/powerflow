@@ -263,6 +263,11 @@ restore_aside() { # restore_aside <aside> -> 0 restored into the lock path
   local aside="$1" entry
   [ -d "$aside" ] && [ -f "$aside/info" ] || return 1
   mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  # Test seam: hold the claim after winning the mkdir election, so a test can
+  # verify another restorer backs off instead of nesting its aside inside.
+  if [[ "${POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR:-0}" -gt 0 ]; then
+    sleep "$POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR"
+  fi
   for entry in "$aside"/* "$aside"/.[!.]* "$aside"/..?*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
     [ "$(basename "$entry")" = "info" ] && continue
@@ -384,7 +389,7 @@ do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_T
   # Ambiguity rule: an existing-but-unreadable lock dir is NEVER reset
   # blindly (a takeover may be in flight — resetting deleted a live lock in
   # testing). Only mkdir-winners write; mkdir is attempted solely when the
-  # dir is believed absent (initial try, post-own-rename, adopted orphan).
+  # dir is believed absent (initial try, post-own-rename, post-recovery).
   # Unsettled states retry briefly, then report held; a genuinely orphaned
   # dir needs an operator `release --force`.
   ACQUIRED_MODE=""
@@ -422,6 +427,11 @@ do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_T
         return 3
       fi
       echo "WARNING: stealing stale integration lock (task '$task', no refresh for $(lock_age "$eff")s >= ${STALE_AFTER}s)." >&2
+      # Test seam: pause after the stale verdict, before the rename, so a test
+      # can let a second thief install a replacement lease in between.
+      if [[ "${POWERFLOW_TEST_PAUSE_TAKEOVER_BEFORE_MOVE:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_TEST_PAUSE_TAKEOVER_BEFORE_MOVE:-0}" -gt 0 ]; then
+        sleep "$POWERFLOW_TEST_PAUSE_TAKEOVER_BEFORE_MOVE"
+      fi
       aside="$MAIN_ROOT/.powerflow/.integration-lock.stale.$$"
       rm -rf "$aside" 2>/dev/null || true
       if ! mv "$LOCK_DIR" "$aside" 2>/dev/null; then
@@ -429,6 +439,11 @@ do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_T
         # writing. Re-read on the next attempt instead of deciding now.
         sleep 0.2
         continue
+      fi
+      # Test seam: pause after the rename, before verification, so a test can
+      # race a concurrent restore of the parked lease.
+      if [[ "${POWERFLOW_TEST_PAUSE_TAKEOVER_AFTER_MOVE:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_TEST_PAUSE_TAKEOVER_AFTER_MOVE:-0}" -gt 0 ]; then
+        sleep "$POWERFLOW_TEST_PAUSE_TAKEOVER_AFTER_MOVE"
       fi
       # Verify-after-move: the rename moves whatever exists NOW, but our
       # stale verdict came from an EARLIER read. If a full steal cycle by
@@ -442,16 +457,14 @@ do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_T
       fi
       if [ -n "$tok" ] && [ "$moved_tokens" != "$tok" ]; then
         echo "WARNING: takeover raced a replacement (aside token mismatch) — restoring and backing off." >&2
-        # Restore only onto an absent target: moving the aside INSIDE a live
-        # third-party dir would strand it (their top-level info stays
-        # intact, so they keep working — but don't do that on purpose).
-        if [ ! -e "$LOCK_DIR" ] && mv "$aside" "$LOCK_DIR" 2>/dev/null; then
-          echo "Error: integration lock changed hands during takeover; backing off." >&2
-          return 3
+        # Hand the displaced lease to the SAME single-winner restore used by
+        # release and acquire recovery: mkdir elects who owns $LOCK_DIR, so a
+        # check-then-move can never nest our aside INSIDE a replacement lock
+        # dir another process just created. The loser leaves the aside
+        # parked for recover_asides instead of touching it.
+        if ! restore_aside "$aside"; then
+          echo "WARNING: displaced lease left parked in ${aside##*/} for recovery." >&2
         fi
-        # Restore failed (third party created the dir meanwhile): the aside
-        # may hold their live lease — leave it for pre-clean; their own
-        # token gates protect them. Never delete it here.
         echo "Error: integration lock changed hands during takeover; backing off." >&2
         return 3
       fi

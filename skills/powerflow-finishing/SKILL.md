@@ -372,6 +372,11 @@ Rules (enforced by the script, same spirit as Sections 2–7):
      lock directory is atomically renamed aside first, then its token is
      verified before deletion. If takeover occurred during a pause, the
      replacement lease is restored unharmed and release is refused with exit 1.
+   - **One restore election**: Release, acquire recovery, and a takeover that
+     discovers it moved a replacement lease all restore through the same
+     helper, which elects the winner with `mkdir` on the lock path and moves
+     `info` last. A loser leaves the parked lease untouched for recovery, so a
+     racing restorer can never nest one aside inside another owner's lock dir.
    - **Release asides are never blind garbage**: Before the rename, release
      publishes an intent (`SINCE`, its own `WINDOW`, expected `TOKEN`). Acquire
      never `rm -rf`s `.rel.*`/`.stale.*` wholesale: while the intent is fresh

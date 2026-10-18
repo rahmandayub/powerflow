@@ -320,4 +320,64 @@ printf 'PID=1\nSINCE=%s\nWINDOW=999999999\nTOKEN=x\n' "$(( $(date +%s) + 100000 
 assert_exit "lock-future-intent-not-blocking" 0 "$CODE"
 rm -rf "$TMP"; trap - EXIT
 
+# 12. Takeover-restore race: a takeover that moved a replacement lease (token
+#     mismatch) must share the single-winner restore election. When another
+#     process has just claimed $LOCK_DIR to restore that same parked lease,
+#     the takeover must back off WITHOUT nesting its aside inside the new lock
+#     dir, and the parked lease must stay heartbeat-able and releasable.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task old --stale-after 100 --porcelain 2>/dev/null)
+TOK_OLD=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+printf 'PID=1\nTASK=old\nSINCE=1\nHEARTBEAT=1\nTOKEN=%s\n' "$TOK_OLD" > "$TMP/.powerflow/.integration-lock/info"
+# A: stale takeover, paused before the rename (so B can steal) and again
+# after the rename (so C can start restoring B's parked lease).
+(cd "$TMP" && POWERFLOW_TEST_PAUSE_TAKEOVER_BEFORE_MOVE=2 POWERFLOW_TEST_PAUSE_TAKEOVER_AFTER_MOVE=2 \
+  bash "$LOCK" acquire --task aaa --stale-after 100 >/dev/null 2>&1; echo "$?" > "$TMP/a.code") &
+A_PID=$!
+sleep 0.4
+OUT_B=$(cd "$TMP" && bash "$LOCK" acquire --task bbb --stale-after 1 --porcelain 2>/dev/null); CODE=$?
+assert_exit "lock-tk-steal" 0 "$CODE"
+TOK_B=$(printf '%s' "$OUT_B" | grep '^TOKEN=' | cut -d= -f2)
+MOVED=0
+for _ in $(seq 1 40); do
+  if grep -Rqs "^TOKEN=$TOK_B$" "$TMP"/.powerflow/.integration-lock.stale.*/info 2>/dev/null; then MOVED=1; break; fi
+  sleep 0.1
+done
+[ "$MOVED" -eq 1 ] && pass "lock-tk-moved-aside" || fail "lock-tk-moved-aside" "takeover aside with B never appeared"
+# C restores B from that aside; it wins the mkdir election and briefly holds
+# the claim, so A reaches its own restore while $LOCK_DIR already exists.
+(cd "$TMP" && POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR=4 bash "$LOCK" acquire --task ccc --stale-after 100 >/dev/null 2>&1; echo "$?" > "$TMP/c.code") &
+C_PID=$!
+CLAIMED=0
+for _ in $(seq 1 40); do
+  if [ -d "$TMP/.powerflow/.integration-lock" ] && [ ! -f "$TMP/.powerflow/.integration-lock/info" ]; then CLAIMED=1; break; fi
+  sleep 0.1
+done
+[ "$CLAIMED" -eq 1 ] && pass "lock-tk-c-claimed" || fail "lock-tk-c-claimed" "C never claimed the lock path"
+wait "$A_PID"; A_CODE=$(cat "$TMP/a.code")
+assert_exit "lock-tk-a-backoff" 3 "$A_CODE"
+# The loser must not consume or move the parked lease it did not win.
+if grep -Rqs "^TOKEN=$TOK_B$" "$TMP"/.powerflow/.integration-lock.stale.*/info 2>/dev/null; then
+  pass "lock-tk-a-left-aside"
+else
+  fail "lock-tk-a-left-aside" "A moved a parked lease it did not win the election for"
+fi
+wait "$C_PID"; C_CODE=$(cat "$TMP/c.code")
+assert_exit "lock-tk-c-held" 3 "$C_CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-tk-b-task" "$OUT" "^HOLDER_TASK=bbb$"
+assert_contains "lock-tk-b-token" "$OUT" "^HOLDER_TOKEN=$TOK_B$"
+if [ -n "$(find "$TMP/.powerflow/.integration-lock" -maxdepth 1 -name '.integration-lock.stale.*' 2>/dev/null)" ]; then
+  fail "lock-tk-no-nesting" "takeover aside nested inside the lock dir"
+else
+  pass "lock-tk-no-nesting"
+fi
+(cd "$TMP" && bash "$LOCK" heartbeat --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-tk-b-hb" 0 "$CODE"
+(cd "$TMP" && bash "$LOCK" release --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-tk-b-rel" 0 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-tk-free" "$OUT" "^LOCK=free$"
+rm -rf "$TMP"; trap - EXIT
+
 summary_of
