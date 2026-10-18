@@ -39,10 +39,16 @@ set -euo pipefail
 #    never pin the lock forever), acquire waits instead of filling the
 #    recovery gap; when an aside parks a lease that is still fresh, acquire
 #    restores it (mkdir election + move) rather than deleting it. Only stale
-#    intents/asides are cleaned, so a third
-#    acquirer can no longer delete a replacement lease displaced by a late
-#    release, while a release that truly dies still recovers after
-#    --stale-after.
+#    intents/asides are cleaned, so a third acquirer can no longer delete a
+#    replacement lease displaced by a late release, while a release that truly
+#    dies still recovers after --stale-after.
+# 4. A restore claim is itself recoverable. restore_aside() publishes a restore
+#    intent (SINCE + WINDOW + parked TOKEN + ASIDE) BEFORE its mkdir election
+#    and moves info last. If the winner dies between mkdir and the info move,
+#    $LOCK_DIR is left empty with a soon-stale intent; the next restorer sees
+#    no fresh claim and RESUMES the abandoned one by moving the parked lease in
+#    (never blindly deleting an info-less dir, which could be a paused
+#    restorer). A crash cannot strand the queue.
 #
 # Architectural boundary:
 # A time-bounded lease with expiration (--stale-after) cannot provide
@@ -255,41 +261,128 @@ has_fresh_intent() { # 0 when some release intent is still authoritative
   return 1
 }
 
+RESTORE_PREFIX="$MAIN_ROOT/.powerflow/.integration-lock.restore"
+
+restore_intent_window() { # seconds a restore claim stays authoritative
+  # A restore is a short filesystem move, so it gets its own small window
+  # (overridable for tests) rather than a full lease window; a crashed
+  # restorer must not strand the queue for --stale-after seconds.
+  local w="${POWERFLOW_RESTORE_INTENT_WINDOW:-60}"
+  [[ "$w" =~ ^[0-9]+$ ]] && [ "$w" -ge 1 ] || w=60
+  [ "$w" -le "$INTENT_MAX_WINDOW" ] || w="$INTENT_MAX_WINDOW"
+  printf '%s' "$w"
+}
+
+has_fresh_restore_intent() { # 0 when a restore claim is still active
+  local intent
+  for intent in "$RESTORE_PREFIX".*.intent; do
+    [ -f "$intent" ] || continue
+    intent_is_fresh "$intent" && return 0
+  done
+  return 1
+}
+
+has_stale_restore_intent() { # 0 when an abandoned restore claim exists
+  local intent
+  for intent in "$RESTORE_PREFIX".*.intent; do
+    [ -f "$intent" ] || continue
+    intent_is_fresh "$intent" || return 0
+  done
+  return 1
+}
+
+clear_stale_restore_intents() { # drop intents whose restore has been resolved
+  local intent
+  for intent in "$RESTORE_PREFIX".*.intent; do
+    [ -f "$intent" ] || continue
+    intent_is_fresh "$intent" && continue
+    rm -f "$intent" 2>/dev/null || true
+  done
+}
+
+move_aside_into_lock() { # <aside> <target> -> 0 moved, info last
+  local aside="$1" target="$2" entry
+  [ -d "$aside" ] && [ -f "$aside/info" ] || return 1
+  for entry in "$aside"/* "$aside"/.[!.]* "$aside"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    [ "$(basename "$entry")" = "info" ] && continue
+    mv -f "$entry" "$target"/ 2>/dev/null || true
+  done
+  mv -f "$aside/info" "$target/info" 2>/dev/null || return 1
+  rmdir "$aside" 2>/dev/null || true
+  return 0
+}
+
 restore_aside() { # restore_aside <aside> -> 0 restored into the lock path
   # Single-winner restore without a non-portable rename-if-absent: mkdir is
   # the election for the lock path (acquirers seeing an existing-but-unreadable
   # dir wait, they never reset it), then the parked lease is moved back. info
   # is moved last so a half-restored dir is never mistaken for a valid lease.
-  local aside="$1" entry
+  #
+  # The claim is itself recoverable: a restore intent is published BEFORE the
+  # mkdir, so a restorer killed between mkdir and the info move leaves behind
+  # an empty $LOCK_DIR plus a (soon stale) intent. The next restorer can then
+  # tell an abandoned partial claim from an active one — same stale-versus-live
+  # discipline as release intents — and resume it instead of stalling forever.
+  local aside="$1" entry tok ri ri_tmp
   [ -d "$aside" ] && [ -f "$aside/info" ] || return 1
-  mkdir "$LOCK_DIR" 2>/dev/null || return 1
-  # Test seam: hold the claim after winning the mkdir election, so a test can
-  # verify another restorer backs off instead of nesting its aside inside.
-  if [[ "${POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR:-0}" -gt 0 ]; then
-    sleep "$POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR"
+  tok=$(intent_field "$aside/info" TOKEN)
+  ri="$RESTORE_PREFIX.$$.intent"
+  ri_tmp="$MAIN_ROOT/.powerflow/.restore-intent.$$"
+  rm -f "$ri" "$ri_tmp" 2>/dev/null || true
+  if ! printf 'PID=%s\nSINCE=%s\nWINDOW=%s\nTOKEN=%s\nASIDE=%s\n' \
+        "$$" "$(now_s)" "$(restore_intent_window)" "${tok:--}" "${aside##*/}" > "$ri_tmp" \
+     || ! mv -f "$ri_tmp" "$ri" 2>/dev/null; then
+    rm -f "$ri_tmp" 2>/dev/null || true
+    return 1
   fi
-  for entry in "$aside"/* "$aside"/.[!.]* "$aside"/..?*; do
-    [ -e "$entry" ] || [ -L "$entry" ] || continue
-    [ "$(basename "$entry")" = "info" ] && continue
-    mv -f "$entry" "$LOCK_DIR"/ 2>/dev/null || true
-  done
-  if ! mv -f "$aside/info" "$LOCK_DIR/info" 2>/dev/null; then
-    # Roll back so the parked lease stays intact in the aside.
+
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    # Test seam: hold the claim after winning the mkdir election, so a test can
+    # verify another restorer backs off instead of nesting its aside inside.
+    if [[ "${POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR:-0}" -gt 0 ]; then
+      sleep "$POWERFLOW_TEST_PAUSE_RESTORE_AFTER_MKDIR"
+    fi
+    if [ "${POWERFLOW_TEST_DIE_IN_RESTORE_AFTER_MKDIR:-0}" = "1" ]; then
+      # Simulate a restorer crash after winning the election, before info is
+      # moved: leave the empty claim and our restore intent behind.
+      exit 99
+    fi
+    if move_aside_into_lock "$aside" "$LOCK_DIR"; then
+      rm -f "$ri" 2>/dev/null || true
+      return 0
+    fi
+    # info move failed: roll back so the parked lease stays intact in the aside.
     for entry in "$LOCK_DIR"/* "$LOCK_DIR"/.[!.]* "$LOCK_DIR"/..?*; do
       [ -e "$entry" ] || [ -L "$entry" ] || continue
       mv -f "$entry" "$aside"/ 2>/dev/null || true
     done
     rmdir "$LOCK_DIR" 2>/dev/null || true
+    rm -f "$ri" 2>/dev/null || true
     return 1
   fi
-  rmdir "$aside" 2>/dev/null || true
-  return 0
+
+  # Lost the election. Drop our own claim before judging the others.
+  rm -f "$ri" 2>/dev/null || true
+  # A real lease already owns the path: someone else completed a restore.
+  [ -f "$LOCK_DIR/info" ] && return 1
+  # Another restorer is mid-restore or merely paused: wait for it.
+  has_fresh_restore_intent && return 1
+  # No active claim, but a stale one exists and $LOCK_DIR is empty: a restorer
+  # died after winning the mkdir. Resume its claim by moving the parked lease
+  # in (info last) and clearing the abandoned intents.
+  if has_stale_restore_intent && move_aside_into_lock "$aside" "$LOCK_DIR"; then
+    clear_stale_restore_intents
+    return 0
+  fi
+  return 1
 }
 
-recover_asides() { # recover_asides -> 0 clear, 3 release in progress/live lease parked
+recover_asides() { # recover_asides -> 0 clear, 3 release/restore in progress or live lease parked
   # Never blind-delete an aside: it may be the active workspace of a paused
   # release. Fresh release intents block acquisition; fresh leases parked in
   # an aside are restored, not deleted; only stale artifacts are discarded.
+  # A restore that died mid-claim is resumed by restore_aside (see below).
   local intent aside holder since hb tok expected force
   # 1. Intent with no aside: crash/pause before the move. Fresh => release is
   #    still in flight; stale => drop the intent and continue.
@@ -370,6 +463,20 @@ recover_asides() { # recover_asides -> 0 clear, 3 release in progress/live lease
       fi
     fi
     rm -rf "$aside" 2>/dev/null || true
+  done
+
+  # 4. Drop restore intents whose parked aside is gone or whose restore was
+  #    superseded by a valid lease, so abandoned claims cannot pile up. A
+  #    stale intent whose aside is still parked and unresolved is left for
+  #    restore_aside to resume.
+  for intent in "$RESTORE_PREFIX".*.intent; do
+    [ -f "$intent" ] || continue
+    intent_is_fresh "$intent" && continue
+    aside=$(intent_field "$intent" ASIDE)
+    if [ -n "$aside" ] && [ -d "$MAIN_ROOT/.powerflow/$aside" ] && [ ! -f "$LOCK_DIR/info" ]; then
+      continue
+    fi
+    rm -f "$intent" 2>/dev/null || true
   done
   return 0
 }
@@ -706,6 +813,12 @@ case "$CMD" in
         [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=held\nHOLDER_TASK=%s\nHOLDER_AGE_S=%s\nHOLDER_TOKEN=%s\n' "$2" "$AGE" "${5:-}"
         echo "Integration lock held by task '$2' (last refresh ${AGE}s ago)." >&2
       fi
+    elif [ -e "$LOCK_DIR" ]; then
+      # The lock path exists but has no readable lease: a restore claimed it
+      # (mkdir election) and has not moved info in yet, or a restorer died mid-
+      # claim. Never report a plain free lock while acquire would wait here.
+      [ "$PORCELAIN_OUT" = true ] && printf 'LOCK=recovering\n'
+      echo "Integration lock path exists without lease metadata; a restore is in progress or pending recovery." >&2
     elif has_fresh_intent; then
       # The lock dir is absent because a release moved it aside and is still
       # working (or paused). Do not report a plain free lock while acquire

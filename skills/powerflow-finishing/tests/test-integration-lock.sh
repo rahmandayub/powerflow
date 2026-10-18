@@ -380,4 +380,52 @@ OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
 assert_contains "lock-tk-free" "$OUT" "^LOCK=free$"
 rm -rf "$TMP"; trap - EXIT
 
+# 13. Restorer crash recovery: a restorer killed between winning the mkdir
+#     election and moving info must not strand the lock. A fresh acquire must
+#     resume the abandoned claim and restore the parked lease, without --force.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task bbb --stale-after 100 --porcelain 2>/dev/null)
+TOK_B=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+# Park B's live lease exactly as a racing takeover/release move would.
+mv "$TMP/.powerflow/.integration-lock" "$TMP/.powerflow/.integration-lock.stale.9999"
+# C restores B, wins the mkdir election, then dies before moving info in.
+# Window is 1s so the abandoned claim goes stale quickly.
+(cd "$TMP" && POWERFLOW_TEST_DIE_IN_RESTORE_AFTER_MKDIR=1 POWERFLOW_RESTORE_INTENT_WINDOW=1 \
+  bash "$LOCK" acquire --task ccc --stale-after 100 >/dev/null 2>&1; echo "$?" > "$TMP/c.code") &
+C_PID=$!
+wait "$C_PID" 2>/dev/null
+CLAIMED=0
+for _ in $(seq 1 40); do
+  if [ -d "$TMP/.powerflow/.integration-lock" ] && [ ! -f "$TMP/.powerflow/.integration-lock/info" ]; then CLAIMED=1; break; fi
+  sleep 0.1
+done
+[ "$CLAIMED" -eq 1 ] && pass "lock-rc-claimed" || fail "lock-rc-claimed" "restorer never claimed the lock path"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-rc-status-recovering" "$OUT" "^LOCK=recovering$"
+[ -n "$(grep -Rls '^ASIDE=.integration-lock.stale.9999$' "$TMP"/.powerflow/.integration-lock.restore.*.intent 2>/dev/null)" ] && pass "lock-rc-intent-recorded" || fail "lock-rc-intent-recorded" "restore intent missing"
+# A fresh acquire must resume the abandoned claim automatically.
+(cd "$TMP" && bash "$LOCK" acquire --task ddd --stale-after 100 >/dev/null 2>&1); CODE=$?
+assert_exit "lock-rc-auto-recovers" 3 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-rc-b-task" "$OUT" "^HOLDER_TASK=bbb$"
+assert_contains "lock-rc-b-token" "$OUT" "^HOLDER_TOKEN=$TOK_B$"
+[ ! -d "$TMP/.powerflow/.integration-lock.stale.9999" ] && pass "lock-rc-aside-consumed" || fail "lock-rc-aside-consumed" "parked aside not consumed"
+if [ -n "$(find "$TMP/.powerflow/.integration-lock" -maxdepth 1 -name '.integration-lock.stale.*' 2>/dev/null)" ]; then
+  fail "lock-rc-no-nesting" "aside nested inside the lock dir"
+else
+  pass "lock-rc-no-nesting"
+fi
+if ls "$TMP"/.powerflow/.integration-lock.restore.*.intent >/dev/null 2>&1; then
+  fail "lock-rc-no-intent-leak" "stale restore intent left behind"
+else
+  pass "lock-rc-no-intent-leak"
+fi
+(cd "$TMP" && bash "$LOCK" heartbeat --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-rc-b-hb" 0 "$CODE"
+(cd "$TMP" && bash "$LOCK" release --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-rc-b-rel" 0 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-rc-free" "$OUT" "^LOCK=free$"
+rm -rf "$TMP"; trap - EXIT
+
 summary_of
