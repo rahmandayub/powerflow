@@ -50,7 +50,9 @@ set -euo pipefail
 #    (never blindly deleting an info-less dir, which could be a paused
 #    restorer). A claim authorizes ONLY the aside and TOKEN it names, so an
 #    unrelated stale claim can never move a different parked lease into the
-#    abandoned dir. A crash cannot strand the queue, and claims cannot cross.
+#    abandoned dir. Intent filenames carry a unique invocation identity, ensuring
+#    that PID reuse cannot delete or clobber preexisting claims. A crash cannot
+#    strand the queue, and claims cannot cross.
 #
 # Architectural boundary:
 # A time-bounded lease with expiration (--stale-after) cannot provide
@@ -337,12 +339,13 @@ restore_aside() { # restore_aside <aside> -> 0 restored into the lock path
   # an empty $LOCK_DIR plus a (soon stale) intent. The next restorer can then
   # tell an abandoned partial claim from an active one — same stale-versus-live
   # discipline as release intents — and resume it instead of stalling forever.
-  local aside="$1" entry tok ri ri_tmp
+  local aside="$1" entry tok ri ri_tmp ri_id
   [ -d "$aside" ] && [ -f "$aside/info" ] || return 1
   tok=$(intent_field "$aside/info" TOKEN)
-  ri="$RESTORE_PREFIX.$$.intent"
-  ri_tmp="$MAIN_ROOT/.powerflow/.restore-intent.$$"
-  rm -f "$ri" "$ri_tmp" 2>/dev/null || true
+  ri_id="$$.$(now_s).$RANDOM"
+  ri="$RESTORE_PREFIX.$ri_id.intent"
+  ri_tmp="$MAIN_ROOT/.powerflow/.restore-intent.$ri_id"
+  rm -f "$ri_tmp" 2>/dev/null || true
   if ! printf 'PID=%s\nSINCE=%s\nWINDOW=%s\nTOKEN=%s\nASIDE=%s\n' \
         "$$" "$(now_s)" "$(restore_intent_window)" "${tok:--}" "${aside##*/}" > "$ri_tmp" \
      || ! mv -f "$ri_tmp" "$ri" 2>/dev/null; then
@@ -363,6 +366,7 @@ restore_aside() { # restore_aside <aside> -> 0 restored into the lock path
     fi
     if move_aside_into_lock "$aside" "$LOCK_DIR"; then
       rm -f "$ri" 2>/dev/null || true
+      remove_stale_restore_claims_for "$aside" "$tok"
       return 0
     fi
     # info move failed: roll back so the parked lease stays intact in the aside.
@@ -559,7 +563,7 @@ do_acquire() { # do_acquire -> 0 acquired, 3 held; sets ACQUIRED_MODE/ACQUIRED_T
       if [[ "${POWERFLOW_TEST_PAUSE_TAKEOVER_BEFORE_MOVE:-0}" =~ ^[0-9]+$ ]] && [ "${POWERFLOW_TEST_PAUSE_TAKEOVER_BEFORE_MOVE:-0}" -gt 0 ]; then
         sleep "$POWERFLOW_TEST_PAUSE_TAKEOVER_BEFORE_MOVE"
       fi
-      aside="$MAIN_ROOT/.powerflow/.integration-lock.stale.$$"
+      aside="$MAIN_ROOT/.powerflow/.integration-lock.stale.$$.$(now_s).$RANDOM"
       rm -rf "$aside" 2>/dev/null || true
       if ! mv "$LOCK_DIR" "$aside" 2>/dev/null; then
         # Rename lost: another thief is mid-takeover, or the owner is
@@ -722,12 +726,12 @@ do_release() { # do_release -> 0 released/already-free, 1 mismatch
     sleep "$POWERFLOW_TEST_PAUSE_RELEASE"
   fi
 
-  local rel_aside rel_intent rel_intent_tmp
-  rel_aside="$REL_PREFIX.$$"
+  local rel_id rel_aside rel_intent rel_intent_tmp
+  rel_id="$$.$(now_s).$RANDOM"
+  rel_aside="$REL_PREFIX.$rel_id"
   rel_intent="$rel_aside.intent"
-  rel_intent_tmp="$MAIN_ROOT/.powerflow/.rel-intent.$$"
-  rm -rf "$rel_aside" 2>/dev/null || true
-  rm -f "$rel_intent" "$rel_intent_tmp" 2>/dev/null || true
+  rel_intent_tmp="$MAIN_ROOT/.powerflow/.rel-intent.$rel_id"
+  rm -f "$rel_intent_tmp" 2>/dev/null || true
 
   # Publish the intent BEFORE moving: concurrent acquires must see that this
   # aside is an active release workspace, not an orphan to clean. Written via

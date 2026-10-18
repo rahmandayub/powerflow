@@ -470,4 +470,44 @@ OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
 assert_contains "lock-mi-free" "$OUT" "^LOCK=free$"
 rm -rf "$TMP"; trap - EXIT
 
+# 15. PID reuse does not delete abandoned restore claims: a restorer with PID P
+#     crashed after winning the mkdir election, leaving an empty $LOCK_DIR and
+#     a stale claim .integration-lock.restore.<P>.intent. A new process that
+#     reuses the exact same PID P (via exec) must not delete the old claim, must
+#     resume the restore into the empty dir, clear the claim upon completion,
+#     and leave the restored lease fully functional.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 --porcelain 2>/dev/null)
+TOK_A=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+# Park the live lease in an aside as if a takeover started
+mv "$TMP/.powerflow/.integration-lock" "$TMP/.powerflow/.integration-lock.stale.9999"
+# Leave the empty lock dir from the crashed restorer
+mkdir "$TMP/.powerflow/.integration-lock"
+
+# In a child shell, get its PID ($$), create the stale intent named with that
+# exact PID, then exec integration-lock acquire so it runs with that same PID:
+(cd "$TMP" && bash -c '
+  printf "PID=%s\nSINCE=%s\nWINDOW=1\nTOKEN=%s\nASIDE=%s\n" \
+    "$$" "$(( $(date +%s) - 10 ))" "'"$TOK_A"'" ".integration-lock.stale.9999" \
+    > ".powerflow/.integration-lock.restore.$$.intent"
+  exec bash "'"$LOCK"'" acquire --task bbb --stale-after 100
+'); CODE=$?
+
+assert_exit "lock-pid-reuse-held" 3 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-pid-reuse-restored" "$OUT" "^HOLDER_TOKEN=$TOK_A$"
+assert_contains "lock-pid-reuse-holder" "$OUT" "^HOLDER_TASK=aaa$"
+[ ! -d "$TMP/.powerflow/.integration-lock.stale.9999" ] && pass "lock-pid-reuse-aside-gone" || fail "lock-pid-reuse-aside-gone" "aside was not consumed"
+if ls "$TMP"/.powerflow/.integration-lock.restore.*.intent >/dev/null 2>&1; then
+  fail "lock-pid-reuse-intent-cleaned" "restore intent was not removed"
+else
+  pass "lock-pid-reuse-intent-cleaned"
+fi
+# aaa is intact and can release cleanly
+(cd "$TMP" && bash "$LOCK" release --task aaa --token "$TOK_A" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-pid-reuse-rel" 0 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-pid-reuse-free" "$OUT" "^LOCK=free$"
+rm -rf "$TMP"; trap - EXIT
+
 summary_of
