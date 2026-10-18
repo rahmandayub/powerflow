@@ -378,11 +378,14 @@ Rules (enforced by the script, same spirit as Sections 2–7):
      `info` last. A loser leaves the parked lease untouched for recovery, so a
      racing restorer can never nest one aside inside another owner's lock dir.
    - **Recoverable restore claim**: The helper publishes a restore intent
-     before claiming. If the winner dies between `mkdir` and the `info` move,
-     the lock path is left empty with a soon-stale intent; the next restorer
-     recognizes the abandoned claim (same stale-vs-live discipline) and resumes
-     it by moving the parked lease in. It never blindly deletes an `info`-less
-     lock dir, which could belong to a merely paused restorer.
+     (`ASIDE` + parked `TOKEN`) before claiming. If the winner dies between
+     `mkdir` and the `info` move, the lock path is left empty with a soon-stale
+     intent; the next restorer recognizes the abandoned claim (same
+     stale-vs-live discipline) and resumes it by moving the parked lease in.
+     A claim authorizes only the aside and token it names — an unrelated stale
+     claim can never move another parked lease into the abandoned dir, and only
+     resolved claims are removed. It never blindly deletes an `info`-less lock
+     dir, which could belong to a merely paused restorer.
    - **Release asides are never blind garbage**: Before the rename, release
      publishes an intent (`SINCE`, its own `WINDOW`, expected `TOKEN`). Acquire
      never `rm -rf`s `.rel.*`/`.stale.*` wholesale: while the intent is fresh

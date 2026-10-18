@@ -48,7 +48,9 @@ set -euo pipefail
 #    $LOCK_DIR is left empty with a soon-stale intent; the next restorer sees
 #    no fresh claim and RESUMES the abandoned one by moving the parked lease in
 #    (never blindly deleting an info-less dir, which could be a paused
-#    restorer). A crash cannot strand the queue.
+#    restorer). A claim authorizes ONLY the aside and TOKEN it names, so an
+#    unrelated stale claim can never move a different parked lease into the
+#    abandoned dir. A crash cannot strand the queue, and claims cannot cross.
 #
 # Architectural boundary:
 # A time-bounded lease with expiration (--stale-after) cannot provide
@@ -282,19 +284,30 @@ has_fresh_restore_intent() { # 0 when a restore claim is still active
   return 1
 }
 
-has_stale_restore_intent() { # 0 when an abandoned restore claim exists
-  local intent
+stale_restore_intent_for() { # <aside> <token> -> prints a matching stale claim
+  # A restore claim authorizes resuming ONLY the exact parked lease it named:
+  # same ASIDE basename and same parked TOKEN. A stale claim for another aside
+  # (or another token in the same aside) proves nothing about this one.
+  local aside="$1" tok="$2" intent itok
   for intent in "$RESTORE_PREFIX".*.intent; do
     [ -f "$intent" ] || continue
-    intent_is_fresh "$intent" || return 0
+    intent_is_fresh "$intent" && continue
+    [ "$(intent_field "$intent" ASIDE)" = "${aside##*/}" ] || continue
+    itok=$(intent_field "$intent" TOKEN)
+    [ "${itok:--}" = "${tok:--}" ] || continue
+    printf '%s' "$intent"
+    return 0
   done
   return 1
 }
 
-clear_stale_restore_intents() { # drop intents whose restore has been resolved
-  local intent
+remove_stale_restore_claims_for() { # <aside> <token> — drop resolved claims only
+  local aside="$1" tok="$2" intent itok
   for intent in "$RESTORE_PREFIX".*.intent; do
     [ -f "$intent" ] || continue
+    [ "$(intent_field "$intent" ASIDE)" = "${aside##*/}" ] || continue
+    itok=$(intent_field "$intent" TOKEN)
+    [ "${itok:--}" = "${tok:--}" ] || continue
     intent_is_fresh "$intent" && continue
     rm -f "$intent" 2>/dev/null || true
   done
@@ -368,11 +381,13 @@ restore_aside() { # restore_aside <aside> -> 0 restored into the lock path
   [ -f "$LOCK_DIR/info" ] && return 1
   # Another restorer is mid-restore or merely paused: wait for it.
   has_fresh_restore_intent && return 1
-  # No active claim, but a stale one exists and $LOCK_DIR is empty: a restorer
-  # died after winning the mkdir. Resume its claim by moving the parked lease
-  # in (info last) and clearing the abandoned intents.
-  if has_stale_restore_intent && move_aside_into_lock "$aside" "$LOCK_DIR"; then
-    clear_stale_restore_intents
+  # No active claim, but $LOCK_DIR is empty. A restorer may have died after
+  # winning the mkdir. Resume ONLY if an abandoned claim names THIS aside and
+  # THIS token — an unrelated stale claim must not authorize moving another
+  # lease into the abandoned dir.
+  if stale_restore_intent_for "$aside" "$tok" >/dev/null \
+     && move_aside_into_lock "$aside" "$LOCK_DIR"; then
+    remove_stale_restore_claims_for "$aside" "$tok"
     return 0
   fi
   return 1
@@ -383,7 +398,7 @@ recover_asides() { # recover_asides -> 0 clear, 3 release/restore in progress or
   # release. Fresh release intents block acquisition; fresh leases parked in
   # an aside are restored, not deleted; only stale artifacts are discarded.
   # A restore that died mid-claim is resumed by restore_aside (see below).
-  local intent aside holder since hb tok expected force
+  local intent aside holder since hb tok expected force blocked=0
   # 1. Intent with no aside: crash/pause before the move. Fresh => release is
   #    still in flight; stale => drop the intent and continue.
   for intent in "$REL_PREFIX".*.intent; do
@@ -438,7 +453,8 @@ recover_asides() { # recover_asides -> 0 clear, 3 release/restore in progress or
         else
           echo "Error: live lease (task '$2') is parked in release aside ${aside##*/}; treating lock as held." >&2
         fi
-        return 3
+        blocked=1
+        continue
       fi
     fi
     rm -rf "$aside" 2>/dev/null || true
@@ -459,7 +475,8 @@ recover_asides() { # recover_asides -> 0 clear, 3 release/restore in progress or
         else
           echo "Error: live lease (task '$2') is parked in takeover aside ${aside##*/}; treating lock as held." >&2
         fi
-        return 3
+        blocked=1
+        continue
       fi
     fi
     rm -rf "$aside" 2>/dev/null || true
@@ -478,6 +495,9 @@ recover_asides() { # recover_asides -> 0 clear, 3 release/restore in progress or
     fi
     rm -f "$intent" 2>/dev/null || true
   done
+  # Keep scanning past a blocked aside so a later aside with a matching
+  # abandoned claim can still make progress; report held if any remained.
+  [ "$blocked" -eq 0 ] || return 3
   return 0
 }
 

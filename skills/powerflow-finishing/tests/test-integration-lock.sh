@@ -428,4 +428,46 @@ OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
 assert_contains "lock-rc-free" "$OUT" "^LOCK=free$"
 rm -rf "$TMP"; trap - EXIT
 
+# 14. Multi-aside claim matching: a stale restore intent naming aside B (and
+#     only B) must not authorize restoring aside A into the abandoned lock
+#     dir. B is resumed; A stays parked until it can be restored on its own.
+TMP=$(make_temp_repo); trap 'rm -rf "$TMP"' EXIT
+OUT=$(cd "$TMP" && bash "$LOCK" acquire --task aaa --stale-after 100 --porcelain 2>/dev/null)
+TOK_A=$(printf '%s' "$OUT" | grep '^TOKEN=' | cut -d= -f2)
+mv "$TMP/.powerflow/.integration-lock" "$TMP/.powerflow/.integration-lock.stale.1111"
+# Fabricate a second parked live lease (bbb) directly: a real acquire would
+# first restore A, which is the behavior under test.
+TOK_B="tok-multi-b"
+NOW=$(date +%s)
+mkdir "$TMP/.powerflow/.integration-lock.stale.2222"
+printf 'PID=2\nTASK=bbb\nSINCE=%s\nHEARTBEAT=%s\nTOKEN=%s\n' "$NOW" "$NOW" "$TOK_B" > "$TMP/.powerflow/.integration-lock.stale.2222/info"
+# One abandoned claim naming B, plus the empty dir the dead restorer left.
+printf 'PID=999\nSINCE=%s\nWINDOW=1\nTOKEN=%s\nASIDE=.integration-lock.stale.2222\n' \
+  "$(( $(date +%s) - 10 ))" "$TOK_B" > "$TMP/.powerflow/.integration-lock.restore.999.intent"
+mkdir "$TMP/.powerflow/.integration-lock"
+(cd "$TMP" && bash "$LOCK" acquire --task ddd --stale-after 100 >/dev/null 2>&1); CODE=$?
+assert_exit "lock-mi-acquire-held" 3 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-mi-b-restored" "$OUT" "^HOLDER_TOKEN=$TOK_B$"
+[ -f "$TMP/.powerflow/.integration-lock.stale.1111/info" ] \
+  && grep -q "^TOKEN=$TOK_A$" "$TMP/.powerflow/.integration-lock.stale.1111/info" \
+  && pass "lock-mi-a-untouched" || fail "lock-mi-a-untouched" "A was restored by a claim naming B"
+[ ! -d "$TMP/.powerflow/.integration-lock.stale.2222" ] && pass "lock-mi-b-claim-consumed" || fail "lock-mi-b-claim-consumed" "B's aside was not consumed"
+[ ! -f "$TMP/.powerflow/.integration-lock.restore.999.intent" ] && pass "lock-mi-b-intent-cleared" || fail "lock-mi-b-intent-cleared" "resolved claim was not removed"
+# B is intact and usable.
+(cd "$TMP" && bash "$LOCK" heartbeat --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-mi-b-hb" 0 "$CODE"
+(cd "$TMP" && bash "$LOCK" release --task bbb --token "$TOK_B" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-mi-b-rel" 0 "$CODE"
+# A was never lost: the next acquire restores it on its own.
+(cd "$TMP" && bash "$LOCK" acquire --task eee --stale-after 100 >/dev/null 2>&1); CODE=$?
+assert_exit "lock-mi-a-later-held" 3 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-mi-a-restored" "$OUT" "^HOLDER_TOKEN=$TOK_A$"
+(cd "$TMP" && bash "$LOCK" release --task aaa --token "$TOK_A" >/dev/null 2>&1); CODE=$?
+assert_exit "lock-mi-a-rel" 0 "$CODE"
+OUT=$(cd "$TMP" && bash "$LOCK" status --porcelain 2>/dev/null)
+assert_contains "lock-mi-free" "$OUT" "^LOCK=free$"
+rm -rf "$TMP"; trap - EXIT
+
 summary_of
